@@ -1,0 +1,160 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-border: var(--border);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-raised: var(--surface-raised);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --font-sans: var(--font-roboto), ui-sans-serif, system-ui, sans-serif;
+}
+
+/*
+  ── Wave design language: YouTube Music, verbatim ─────────────────────────
+  #030303 canvas, #212121 surfaces, monochrome white accent (red reserved for
+  the brand dot), Roboto everywhere. No custom touches.
+*/
+:root {
+  --bg: #030303;
+  --surface: #0f0f0f;
+  --surface-2: #212121;
+  --surface-3: #383838;
+  --surface-raised: #3f3f3f;
+  --border: rgba(255, 255, 255, 0.1);
+  --foreground: #ffffff;
+  --muted-foreground: #aaaaaa;
+  --accent: #ffffff;
+  --accent-foreground: #0a0a0a;
+
+  --background: var(--bg);
+  --muted: var(--surface-2);
+
+  /* dropdown/popover surface — YTM menus are #212121 cards; without this token
+     bg-popover resolves to nothing and every three-dot menu renders transparent */
+  --popover: var(--surface-2);
+  --popover-foreground: var(--foreground);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+}
+
+body {
+  font-family: var(--font-roboto), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* hide scrollbars on carousels / chip rows */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* styled scrollbar for main panes */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* equalizer bars animation */
+@keyframes eq {
+  0%,
+  100% {
+    height: 25%;
+  }
+  30% {
+    height: 95%;
+  }
+  60% {
+    height: 45%;
+  }
+}
+.animate-eq {
+  height: 60%;
+  animation: eq 0.9s ease-in-out infinite alternate;
+}
+
+/* album art fade-in over procedural gradient */
+@keyframes fadein {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-fadein {
+  animation: fadein 0.45s ease-out both;
+}
+
+/* volume slider thumb */
+.slider-accent::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #fff;
+  cursor: pointer;
+}
+.slider-accent::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 999px;
+  background: #fff;
+  cursor: pointer;
+}
+
+/* selection */
+::selection {
+  background: rgba(255, 107, 74, 0.35);
+}
+
+/* focus visibility for a11y */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Text inputs signal focus via their container (focus-within border), not a
+   hard inner outline — prevents the double-ring look on the search pill. */
+input:focus-visible,
+textarea:focus-visible {
+  outline: none;
+}
