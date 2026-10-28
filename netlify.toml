@@ -1,0 +1,15 @@
+# Netlify deploy config for Wave (Next.js 16, App Router + API routes).
+# The API routes (search / radio / stream / thumbs) are server functions —
+# the site MUST run through Netlify's Next.js runtime, never as a static publish.
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  # Next.js 16 requires Node >= 20.9 — pin a current LTS
+  NODE_VERSION = "22"
+
+# Official Next.js runtime: packages SSR pages + API routes as Netlify functions.
+# Netlify auto-installs it for Next sites; declaring it here pins the behavior.
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
