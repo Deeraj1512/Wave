@@ -6,12 +6,15 @@
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
     "build": "next build",
     "build:standalone": "NEXT_OUTPUT=standalone next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "build:apk": "node scripts/build-apk-web.mjs && npx cap sync android",
     "start": "next start",
     "start:standalone": "NODE_ENV=production node .next/standalone/server.js",
     "lint": "eslint .",
     "db:push": "echo '[db:push] Wave uses no local database (YouTube Innertube backend) — skipped'"
   },
   "dependencies": {
+    "@capacitor/android": "^7",
+    "@capacitor/core": "^7",
     "@radix-ui/react-dialog": "^1.1.14",
     "@radix-ui/react-dropdown-menu": "^2.1.15",
     "@radix-ui/react-toast": "^1.2.14",
@@ -28,6 +31,7 @@
     "z-ai-web-dev-sdk": "^0.0.18"
   },
   "devDependencies": {
+    "@capacitor/cli": "^7",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
