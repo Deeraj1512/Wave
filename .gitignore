@@ -57,3 +57,5 @@ server.log
 /upload/
 /worklog.md
 /.zscripts/
+# APK build workspace (local Android SDK, isolated export builds)
+/apkwork/

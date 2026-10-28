@@ -7,8 +7,14 @@ import type { NextConfig } from "next";
 // strictly opt-in via NEXT_OUTPUT=standalone. `bun run build:standalone`.
 const standalone = process.env.NEXT_OUTPUT === "standalone";
 
+// `NEXT_EXPORT=1` produces a fully static SPA bundle in ./out — the web assets
+// packaged into the Android APK (Capacitor webDir). In this mode there are no
+// API routes (the device runs the Echo chain in-process) and no image optimizer.
+const apkExport = process.env.NEXT_EXPORT === "1";
+
 const nextConfig: NextConfig = {
   ...(standalone ? { output: "standalone" as const } : {}),
+  ...(apkExport ? { output: "export" as const } : {}),
   devIndicators: false,
   /* config options here */
   typescript: {
@@ -16,6 +22,8 @@ const nextConfig: NextConfig = {
   },
   reactStrictMode: false,
   images: {
+    // APK export: no optimizer server exists inside the WebView — ship raw <img>
+    ...(apkExport ? { unoptimized: true } : {}),
     // allow cache-busting query strings on local images (e.g. /wave-mark.png?v=2);
     // without a search clause, any query is permitted
     localPatterns: [{ pathname: "/**" }],

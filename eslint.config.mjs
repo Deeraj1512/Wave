@@ -10,7 +10,7 @@ const eslintConfig = [
   ...nextCoreWebVitals,
   ...nextTypescript,
   {
-    ignores: ["ref/**", "echo-ref/**", ".zscripts/**", "node_modules/**"],
+    ignores: ["ref/**", "echo-ref/**", ".zscripts/**", "node_modules/**", "android/**", "apkwork/**"],
   },
   {
   rules: {
@@ -50,7 +50,7 @@ const eslintConfig = [
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "android/**", "apkwork/**"]
 }];
 
 export default eslintConfig;
