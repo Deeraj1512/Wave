@@ -1,0 +1,14 @@
+[
+    {
+        "relation": [
+            "delegate_permission/common.handle_all_urls"
+        ],
+        "target": {
+            "namespace": "android_app",
+            "package_name": "app.netlify.wave_musical.twa",
+            "sha256_cert_fingerprints": [
+                "EA:B6:65:F3:6D:0B:90:20:CD:2B:09:07:7B:68:DD:49:65:AB:7C:36:1B:C3:86:C0:C0:7B:83:3D:9A:AA:BB:0A"
+            ]
+        }
+    }
+]
