@@ -13,3 +13,23 @@
 # Netlify auto-installs it for Next sites; declaring it here pins the behavior.
 [[plugins]]
   package = "@netlify/plugin-nextjs"
+
+# ── PWA ───────────────────────────────────────────────────────────────────────
+# Service worker must revalidate on every fetch so new deploys take over fast.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+# Offline fallback page: cacheable, it only changes with deploys.
+[[headers]]
+  for = "/offline.html"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+# Digital Asset Links — verifies the Android TWA (PWABuilder package) so the
+# installed app runs fullscreen with no URL bar.
+[[headers]]
+  for = "/.well-known/assetlinks.json"
+  [headers.values]
+    Content-Type = "application/json"
