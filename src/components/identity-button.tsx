@@ -24,7 +24,8 @@ export function IdentityButton() {
     );
   }
 
-  const name = user.user_metadata?.full_name || user.email?.split("@")[0] || "Account";
+  const name =
+    (user.userMetadata?.full_name as string | undefined) || user.name || user.email?.split("@")[0] || "Account";
 
   return (
     <button
