@@ -72,6 +72,17 @@ public class WaveAudioPlugin extends Plugin {
         i.putExtra(MediaPlaybackService.EXTRA_ALBUM, orEmpty(call.getString("album")));
         i.putExtra(MediaPlaybackService.EXTRA_COVER, orEmpty(call.getString("cover")));
         i.putExtra(MediaPlaybackService.EXTRA_PLAYING, playing);
+        // seek-bar feed (seconds): duration makes Android render the card's bar
+        // at all; position anchors it to truth (the service extrapolates in
+        // between). Absent keys → no extra → the service keeps its own value.
+        Double durationSec = call.getDouble("duration");
+        if (durationSec != null && durationSec > 0 && !durationSec.isNaN()) {
+            i.putExtra(MediaPlaybackService.EXTRA_DURATION, durationSec);
+        }
+        Double positionSec = call.getDouble("position");
+        if (positionSec != null && positionSec >= 0 && !positionSec.isNaN()) {
+            i.putExtra(MediaPlaybackService.EXTRA_POSITION, positionSec);
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(i);
