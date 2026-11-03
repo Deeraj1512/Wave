@@ -12,6 +12,9 @@ const roboto = Roboto({
 export const metadata: Metadata = {
   title: "Wave — Your music, your language",
   description: "A personal music app for friends. Originals only — search, play, and discover Indian music across every language. Free forever.",
+  // served by src/app/manifest.webmanifest/route.ts (force-static: the APK
+  // export build refuses unmarked route handlers)
+  manifest: "/manifest.webmanifest",
 };
 
 export const viewport: Viewport = {
