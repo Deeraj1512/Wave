@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
 import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio } from "./api";
-import { notifyPlayState, notifyNativeMedia } from "./nativeBackground";
+import { notifyPlayState, notifyNativeMedia, notifyNativeProgress } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import * as ytEmbed from "./ytEmbed";
@@ -427,9 +427,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       a.preload = "auto";
       // Background-play bridge (APK): the native foreground service follows the
       // element's audible state so Android never freezes the process mid-song.
-      // On web notifyPlayState is a no-op.
-      a.addEventListener("playing", () => notifyPlayState(true));
-      a.addEventListener("pause", () => notifyPlayState(false));
+      // On web notifyPlayState is a no-op. Each event rides the exact position
+      // snapshot along so the card's seek bar anchors to truth (Android
+      // extrapolates the seconds in between itself).
+      const snap = () => ({
+        position: a.currentTime || 0,
+        duration: Number.isFinite(a.duration) && a.duration > 0 ? a.duration : undefined,
+      });
+      a.addEventListener("playing", () => notifyPlayState(true, snap()));
+      a.addEventListener("pause", () => notifyPlayState(false, snap()));
+      a.addEventListener("seeked", () => notifyPlayState(isPlayingRef.current, snap()));
       a.addEventListener("ended", () => notifyPlayState(false));
       audioRef.current = a;
     }
@@ -712,7 +719,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             }
             setBuffering(false);
             setIsPlaying(true);
-            notifyPlayState(true);
+            notifyPlayState(true, { position: ytEmbed.getTime(), duration: ytEmbed.getDuration() });
             stopSim();
             // the iframe's own session just (re)claimed audio focus — re-take the
             // OS card for Wave's session (freshest audible media wins)
@@ -720,7 +727,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           } else if (s === "paused") {
             // a deliberate pause is healthy playback — stand down the failure watchdog
             setIsPlaying(false);
-            notifyPlayState(false);
+            notifyPlayState(false, { position: ytEmbed.getTime(), duration: ytEmbed.getDuration() });
             if (embedWatchdogRef.current) {
               clearTimeout(embedWatchdogRef.current);
               embedWatchdogRef.current = null;
@@ -1577,8 +1584,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     // APK notification/lock-screen card: MediaPlaybackService evaluates
     // window.__waveMediaAction(action) for its prev/play-pause/next buttons —
     // same guarded semantics as the MediaSession handlers above.
-    const w = window as unknown as { __waveMediaAction?: (action: string) => void };
-    w.__waveMediaAction = (action: string) => {
+    const w = window as unknown as { __waveMediaAction?: (action: string, pos?: number) => void };
+    w.__waveMediaAction = (action: string, pos?: number) => {
       try {
         if (action === "play") {
           if (!isPlayingRef.current) togglePlay();
@@ -1588,6 +1595,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           next();
         } else if (action === "prev") {
           prev();
+        } else if (action === "seek") {
+          // card seek bar / scrub — pos arrives in SECONDS from the service
+          if (typeof pos === "number" && Number.isFinite(pos) && pos >= 0) seek(pos);
         }
       } catch {
         /* a dead card button must never crash the player */
@@ -1606,7 +1616,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const modeHint = [shuffle ? "Shuffle on" : "", repeat === 1 ? "Loop all" : "", repeat === 2 ? "Loop one" : ""]
     .filter(Boolean)
     .join(" · ");
+  // track-change detector: the card's seek bar must restart from 0 on a NEW
+  // song (the service keeps extrapolating the old position otherwise), but a
+  // mid-song re-push (shuffle/repeat toggle) must NOT rewind it
+  const nativeCardIdRef = useRef<string | null>(null);
   useEffect(() => {
+    const idChanged = !!current && nativeCardIdRef.current !== current.id;
+    nativeCardIdRef.current = current?.id ?? null;
     syncTrackMetadata(
       current
         ? {
@@ -1628,6 +1644,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
             cover: current.cover,
             playing: isPlayingRef.current,
+            duration: current.duration > 0 ? current.duration : undefined,
+            position: idChanged ? 0 : undefined,
           }
         : null
     );
@@ -1654,14 +1672,26 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
             cover: current.cover,
             playing: isPlaying,
+            // exact seek-bar state at every play/pause transition — readDuration
+            // falls back to the embed's duration when the track row lacks one
+            position: readPosition(),
+            duration: readDuration() > 0 ? readDuration() : undefined,
           }
         : null
     );
   }, [isPlaying, readPosition, readDuration, current, modeHint]);
 
   // ~1Hz scrubber sync while progress ticks (500ms embed poll / timeupdate / sim 1s)
+  const nativeResyncTickRef = useRef(0);
   useEffect(() => {
     pushPositionState(readPosition(), readDuration());
+    // every ~10 ticks (~10s): one cheap IPC that re-glues the APK card's seek
+    // bar to reality through buffering stalls and long-play drift
+    nativeResyncTickRef.current += 1;
+    if (isPlayingRef.current && nativeResyncTickRef.current % 10 === 0) {
+      const dur = readDuration();
+      if (dur > 0) notifyNativeProgress(readPosition(), dur);
+    }
   }, [progress, readPosition, readDuration]);
 
   // ── manual queue ops (Spotify's priority layer) ─────────────────────────────
