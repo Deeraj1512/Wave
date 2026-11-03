@@ -21,6 +21,12 @@ export interface NativeMediaMeta {
   album?: string;
   cover?: string;
   playing: boolean;
+  /** Track length in SECONDS — the card's seek bar total. Android hides the
+   *  bar entirely while it is 0/absent, so it must ride along once per track. */
+  duration?: number;
+  /** Current playback position in SECONDS. Android extrapolates the bar between
+   *  pushes (speed 1.0), so one push per play/pause/seek/track-change is enough. */
+  position?: number;
 }
 
 type WaveAudioPlugin = {
@@ -55,7 +61,10 @@ function plugin(): WaveAudioPlugin | undefined {
  * permission once); paused → keep the card with a ▶ button (YTM behavior) but
  * let go of the wake lock natively.
  */
-export function notifyPlayState(playing: boolean): void {
+export function notifyPlayState(
+  playing: boolean,
+  snap?: { position?: number; duration?: number }
+): void {
   const p = plugin();
   if (!p) return;
   try {
@@ -70,6 +79,17 @@ export function notifyPlayState(playing: boolean): void {
         }
       }
       serviceStarted = true;
+      // Ride the exact resume point along — the card's bar starts from truth
+      // instead of the service's last (possibly stale) extrapolation.
+      p.update?.({
+        title: lastMeta?.title ?? "Wave",
+        artist: lastMeta?.artist ?? "",
+        album: lastMeta?.album,
+        cover: lastMeta?.cover,
+        playing: true,
+        position: snap?.position,
+        duration: snap?.duration,
+      });
     } else if (serviceStarted) {
       p.update?.({
         title: lastMeta?.title ?? "Wave",
@@ -77,6 +97,8 @@ export function notifyPlayState(playing: boolean): void {
         album: lastMeta?.album,
         cover: lastMeta?.cover,
         playing: false,
+        position: snap?.position,
+        duration: snap?.duration ?? lastMeta?.duration,
       });
     }
   } catch {
@@ -117,5 +139,29 @@ export function notifyNativeMedia(meta: NativeMediaMeta | null): void {
     p.update?.(meta);
   } catch {
     /* the background service is an enhancement — never break playback over it */
+  }
+}
+
+/**
+ * Slow-cadence position resync from the player's ~1Hz progress tick (call it
+ * every ~10s, not every tick — each call is an IPC round-trip into the
+ * service). Keeps the card's bar glued to reality through buffering stalls
+ * and long-play drift; Android extrapolates the seconds in between itself.
+ */
+export function notifyNativeProgress(position: number, duration: number): void {
+  const p = plugin();
+  if (!p || !serviceStarted || !lastMeta) return;
+  try {
+    p.update?.({
+      title: lastMeta.title,
+      artist: lastMeta.artist,
+      album: lastMeta.album,
+      cover: lastMeta.cover,
+      playing: lastMeta.playing,
+      position,
+      duration: duration > 0 ? duration : undefined,
+    });
+  } catch {
+    /* best-effort */
   }
 }
