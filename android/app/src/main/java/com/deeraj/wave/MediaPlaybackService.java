@@ -71,6 +71,8 @@ public class MediaPlaybackService extends Service {
     static final String EXTRA_ALBUM = "album";
     static final String EXTRA_COVER = "cover";
     static final String EXTRA_PLAYING = "playing";
+    static final String EXTRA_DURATION = "duration";
+    static final String EXTRA_POSITION = "position";
 
     /** The live WebView (set by MainActivity) — transport actions are evaluated into the web player. */
     private static WeakReference<WebView> webViewRef = new WeakReference<>(null);
@@ -96,6 +98,23 @@ public class MediaPlaybackService extends Service {
     private Bitmap art;
     private String loadedArtUrl = "";
     private boolean artInFlight = false;
+
+    // seek-bar state: duration from JS, position anchored at the last
+    // applySessionState() and extrapolated against the wall clock while playing
+    private long durationMs = 0;
+    private long positionMs = 0;
+    private float speedAtSet = 0f;
+    private long setAtElapsed = 0L;
+
+    /** The bar's true position right now: the anchored position advanced by the
+     *  elapsed playing time (clamped to the track), frozen when paused. */
+    private long extrapolatedPositionMs() {
+        if (speedAtSet <= 0) return positionMs;
+        long elapsed = SystemClock.elapsedRealtime() - setAtElapsed;
+        long pos = positionMs + (long) (elapsed * speedAtSet);
+        if (durationMs > 0 && pos > durationMs) pos = durationMs;
+        return Math.max(0, pos);
+    }
 
     @Override
     public void onCreate() {
@@ -129,6 +148,16 @@ public class MediaPlaybackService extends Service {
             public void onSkipToPrevious() {
                 dispatch("prev");
             }
+
+            @Override
+            public void onSeekTo(long pos) {
+                // jump the bar immediately (no snap-back while the JS round-trip
+                // runs) and let the player adopt the same second
+                positionMs = Math.max(0, pos);
+                speedAtSet = 0f;
+                applySessionState();
+                dispatch("seek", pos / 1000.0);
+            }
         });
         session.setActive(true);
     }
@@ -154,6 +183,22 @@ public class MediaPlaybackService extends Service {
             String c = intent.getStringExtra(EXTRA_COVER);
             coverUrl = c == null ? "" : c.trim();
             playing = intent.getBooleanExtra(EXTRA_PLAYING, playing);
+            // seek-bar feed — duration in s → ms; an explicit position anchors
+            // the bar, otherwise it keeps its own extrapolated truth
+            if (intent.hasExtra(EXTRA_DURATION)) {
+                double d = intent.getDoubleExtra(EXTRA_DURATION, 0);
+                durationMs = d > 0 ? (long) (d * 1000.0) : 0;
+            }
+            if (intent.hasExtra(EXTRA_POSITION)) {
+                double p = intent.getDoubleExtra(EXTRA_POSITION, 0);
+                positionMs = Math.max(0, (long) (p * 1000.0));
+            } else {
+                positionMs = extrapolatedPositionMs();
+            }
+        } else {
+            // transport intents (play/pause/next/prev from the card itself)
+            // carry no position — freeze/advance the bar where it really is
+            positionMs = extrapolatedPositionMs();
         }
 
         Notification n = buildNotification();
@@ -187,19 +232,27 @@ public class MediaPlaybackService extends Service {
     private void applySessionState() {
         if (session != null) {
             try {
+                long now = SystemClock.elapsedRealtime();
                 session.setPlaybackState(new PlaybackStateCompat.Builder()
                         .setActions(PlaybackStateCompat.ACTION_PLAY
                                 | PlaybackStateCompat.ACTION_PAUSE
                                 | PlaybackStateCompat.ACTION_PLAY_PAUSE
                                 | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-                                | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS)
+                                | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+                                | PlaybackStateCompat.ACTION_SEEK_TO)
                         .setState(playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
-                                0, 1f)
+                                positionMs, playing ? 1f : 0f, now)
                         .build());
+                positionMs = Math.max(0, positionMs);
+                speedAtSet = playing ? 1f : 0f;
+                setAtElapsed = now;
                 MediaMetadataCompat.Builder mb = new MediaMetadataCompat.Builder()
                         .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
                         .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
                 if (!album.isEmpty()) mb.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album);
+                // THE seek-bar enabler: Android renders the card's bar only when
+                // the metadata carries a duration AND the state supports seek
+                if (durationMs > 0) mb.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs);
                 if (art != null) mb.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
                 session.setMetadata(mb.build());
             } catch (Exception ignored) {
@@ -249,11 +302,17 @@ public class MediaPlaybackService extends Service {
 
     /** Route a transport action into the web player. Must run on the main thread. */
     private void dispatch(String action) {
+        dispatch(action, Double.NaN);
+    }
+
+    /** dispatch with an optional numeric argument (the card's seek target, seconds). */
+    private void dispatch(String action, double posSec) {
         WebView wv = webViewRef.get();
         if (wv == null) return;
         try {
+            String posArg = Double.isNaN(posSec) ? "" : "," + posSec;
             String js = "(function(){try{if(typeof window.__waveMediaAction==='function'){window.__waveMediaAction('"
-                    + action + "');return true}return false}catch(e){return false}})()";
+                    + action + "'" + posArg + ");return true}return false}catch(e){return false}})()";
             wv.evaluateJavascript(js, null);
         } catch (Exception ignored) {
             // activity torn down (app swiped away) — nothing to control
