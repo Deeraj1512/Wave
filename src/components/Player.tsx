@@ -220,7 +220,7 @@ export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQue
   const engineTag = soundBlocked ? " · muted — tap for sound" : buffering ? " · buffering…" : engine === "sim" ? " · preview mode" : "";
 
   return (
-    <div className="pointer-events-auto relative">
+    <div className="pointer-events-auto relative" data-wave-ptr-ignore>
       {/* muted-autoplay recovery pill — the very next tap restores sound */}
       {soundBlocked && isPlaying && (
         <button
@@ -498,6 +498,7 @@ export function FullPlayer() {
           transition={{ type: "spring", damping: 30, stiffness: 300 }}
           style={{ y: dismissY, willChange: "transform" }}
           className="fixed inset-0 z-50 flex flex-col overflow-hidden"
+          data-wave-ptr-ignore
           role="dialog"
           aria-label="Now playing"
         >

@@ -22,6 +22,10 @@ const config: CapacitorConfig = {
   android: {
     allowMixedContent: false,
     webContentsDebuggingEnabled: true,
+    // Android 15 (targetSdk 35) enforces edge-to-edge: without this the WebView
+    // draws UNDER the status bar — the Wave wordmark collided with the clock.
+    // "force" insets the WebView below the system bars on every device.
+    adjustMarginsForEdgeToEdge: "force",
   },
   plugins: {
     // Route every window.fetch through the native HTTP stack: no CORS preflights

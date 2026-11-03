@@ -4,6 +4,7 @@ import { useState } from "react";
 import { PlayerProvider, usePlayer } from "@/lib/player";
 import { TopBar, Sidebar, BottomNav } from "@/components/Shell";
 import { MiniPlayer, FullPlayer, QueuePanel } from "@/components/Player";
+import { PullToRefresh } from "@/components/PullToRefresh";
 import { ShortcutsLayer } from "@/components/Shortcuts";
 import { HomeScreen } from "@/components/screens/Home";
 import { SearchScreen } from "@/components/screens/Search";
@@ -83,6 +84,7 @@ function AppShell() {
       </div>
 
       <FullPlayer />
+      <PullToRefresh />
       <ShortcutsLayer
         navigate={navigate}
         onToggleQueuePanel={() => setPanelOpen((v) => !v)}

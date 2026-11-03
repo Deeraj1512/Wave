@@ -24,7 +24,7 @@ const NAV_ITEMS = [
 export function TopBar({ screen, navigate }: { screen: Screen; navigate: (s: Screen) => void }) {
   const onSearchScreen = screen.name === "search";
   return (
-    <header className="relative z-30 flex h-14 shrink-0 items-center gap-3 bg-[var(--bg)] px-4 sm:px-5">
+    <header className="relative z-30 flex min-h-14 shrink-0 items-center gap-3 bg-[var(--bg)] px-4 pt-[env(safe-area-inset-top)] sm:px-5">
       {/* brand — mark + wordmark */}
       <button onClick={() => navigate({ name: "home" })} className="flex shrink-0 items-center gap-2.5" aria-label="Wave home">
         <Image src="/wave-mark.png?v=3" alt="" width={28} height={28} priority className="h-7 w-7 rounded-[9px]" aria-hidden />

@@ -61,6 +61,7 @@ function SheetFrame({ title, subtitle, onClose, children }: { title: string; sub
       transition={{ duration: 0.18 }}
       onClick={onClose}
       className="fixed inset-0 z-[70] bg-black/55 backdrop-blur-[2px]"
+      data-wave-ptr-ignore
       role="dialog"
       aria-label={title}
     >

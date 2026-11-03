@@ -158,3 +158,21 @@ input:focus-visible,
 textarea:focus-visible {
   outline: none;
 }
+
+/* ── pull-to-refresh (PullToRefresh.tsx) ────────────────────────────────────
+   The app owns the over-pull gesture in JS; keep the browser's native
+   pull/glow/stretch out of the way at every scroll edge. */
+html,
+body {
+  overscroll-behavior-y: none;
+}
+
+@keyframes wave-ptr-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.wave-ptr-spin {
+  animation: wave-ptr-rotate 0.82s linear infinite;
+}

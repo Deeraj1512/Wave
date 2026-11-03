@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
 import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio } from "./api";
-import { notifyPlayState } from "./nativeBackground";
+import { notifyPlayState, notifyNativeMedia } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import * as ytEmbed from "./ytEmbed";
@@ -1574,7 +1574,29 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       position: readPosition,
       duration: readDuration,
     });
-    return () => clearMediaSession();
+    // APK notification/lock-screen card: MediaPlaybackService evaluates
+    // window.__waveMediaAction(action) for its prev/play-pause/next buttons —
+    // same guarded semantics as the MediaSession handlers above.
+    const w = window as unknown as { __waveMediaAction?: (action: string) => void };
+    w.__waveMediaAction = (action: string) => {
+      try {
+        if (action === "play") {
+          if (!isPlayingRef.current) togglePlay();
+        } else if (action === "pause") {
+          if (isPlayingRef.current) togglePlay();
+        } else if (action === "next") {
+          next();
+        } else if (action === "prev") {
+          prev();
+        }
+      } catch {
+        /* a dead card button must never crash the player */
+      }
+    };
+    return () => {
+      delete w.__waveMediaAction;
+      clearMediaSession();
+    };
   }, [togglePlay, next, prev, seek, readPosition, readDuration]);
 
   // card content follows the queue (id in deps: the mock→videoId swap re-syncs artwork).
@@ -1597,6 +1619,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           }
         : null
     );
+    // APK card mirrors the same content (null tears the service + card down)
+    notifyNativeMedia(
+      current
+        ? {
+            title: current.title,
+            artist: current.artist,
+            album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
+            cover: current.cover,
+            playing: isPlayingRef.current,
+          }
+        : null
+    );
   }, [current?.id, current?.title, current?.artist, current?.album, current?.movie, current?.cover, modeHint]);
 
   // mirror isPlaying — a stale state renders a dead ⏸/▶ button
@@ -1611,7 +1645,19 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     if (isPlaying) reassertMetadata();
     // snap the notification scrubber to truth on every play/pause transition
     pushPositionState(readPosition(), readDuration(), true);
-  }, [isPlaying, readPosition, readDuration]);
+    // APK card: flip its ▶/⏸ button (and arm the service on first play)
+    notifyNativeMedia(
+      current
+        ? {
+            title: current.title,
+            artist: current.artist,
+            album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
+            cover: current.cover,
+            playing: isPlaying,
+          }
+        : null
+    );
+  }, [isPlaying, readPosition, readDuration, current, modeHint]);
 
   // ~1Hz scrubber sync while progress ticks (500ms embed poll / timeupdate / sim 1s)
   useEffect(() => {
