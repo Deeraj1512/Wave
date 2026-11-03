@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Wave's canvas color — also the window background that shows through the
+         system-bar strips around the edge-to-edge WebView. -->
+    <color name="wave_bg">#030303</color>
+</resources>

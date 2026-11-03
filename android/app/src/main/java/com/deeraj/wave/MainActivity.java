@@ -1,6 +1,7 @@
 package com.deeraj.wave;
 
 import android.os.Bundle;
+import android.view.View;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -10,9 +11,15 @@ public class MainActivity extends BridgeActivity {
         // Queue/radio auto-advance calls audio.play() without a user gesture —
         // WebView's default block would stall the second song and onward.
         bridge.getWebView().getSettings().setMediaPlaybackRequiresUserGesture(false);
+        // Pull-to-refresh is Wave's own JS gesture (PullToRefresh.tsx) — kill the
+        // WebView's native overscroll stretch/glow so it is the only response.
+        bridge.getWebView().setOverScrollMode(View.OVER_SCROLL_NEVER);
         // Background play: JS calls WaveAudio.start()/stop() around audible playback
         // to run the foreground mediaPlayback service (keeps the process alive).
         registerPlugin(WaveAudioPlugin.class);
+        // The media-notification card routes its transport buttons into the web
+        // player through window.__waveMediaAction on this WebView.
+        MediaPlaybackService.setWebView(bridge.getWebView());
     }
 
     @Override

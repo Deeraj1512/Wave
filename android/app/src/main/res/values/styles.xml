@@ -9,10 +9,18 @@
         <item name="colorAccent">@color/colorAccent</item>
     </style>
 
+    <!-- Wave is always dark: the window background fills the system-bar strips
+         left by the edge-to-edge WebView margins (adjustMarginsForEdgeToEdge),
+         and the bar icons stay light whatever the system theme is. -->
     <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
         <item name="android:background">@null</item>
+        <item name="android:windowBackground">@color/wave_bg</item>
+        <item name="android:statusBarColor">@color/wave_bg</item>
+        <item name="android:navigationBarColor">@color/wave_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 
 
