@@ -3,7 +3,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, animate, motion, Reorder, useDragControls, useMotionValue, useTransform } from "framer-motion";
 import {
-  ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Volume2, VolumeX, X,
+  ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Trash2, Volume2, VolumeX, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayer, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
@@ -56,8 +56,11 @@ export function GradientWash({ colors, className }: { colors: [string, string]; 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SeekArea — YTM's expressive thick seek bar: hairline at rest, grows + thumb
-// on hover. Shared by the desktop player bar and the now-playing view.
+// SeekArea — YTM's expressive thick seek bar, now fully fingerable: grab the
+// thumb (always visible on the now-playing view, hover on the desktop bar),
+// drag freely forward/back with a live time bubble above it, release to land.
+// Pointer-capture based, so the drag never breaks out of the bar — and the
+// pointerdown is stopped from reaching the player's pan gestures.
 // ─────────────────────────────────────────────────────────────────────────────
 function SeekArea({
   progress,
@@ -65,36 +68,103 @@ function SeekArea({
   onSeek,
   tone = "base",
   className,
+  thumb = "hover",
 }: {
   progress: number;
   duration: number;
   onSeek: (sec: number) => void;
   tone?: "base" | "light";
   className?: string;
+  /** "always" — the now-playing dot never hides (YTM); "hover" — desktop bar */
+  thumb?: "hover" | "always";
 }) {
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const [dragPct, setDragPct] = useState<number | null>(null);
+  const dragging = dragPct !== null;
   const pct = duration > 0 ? Math.min(100, Math.max(0, (progress / duration) * 100)) : 0;
+  const shown = dragging ? dragPct : pct;
   const trackBg = tone === "light" ? "bg-white/20" : "bg-white/15";
   const fillBg = tone === "light" ? "bg-white" : "bg-foreground";
+  const pctAt = (clientX: number) => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return 0;
+    return Math.min(100, Math.max(0, ((clientX - rect.left) / rect.width) * 100));
+  };
   return (
     <div
-      className={cn("group/bar relative h-6 min-w-0 flex-1 cursor-pointer", className)}
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        onSeek(((e.clientX - rect.left) / rect.width) * duration);
-      }}
+      ref={barRef}
+      className={cn("group/bar relative h-6 min-w-0 flex-1 cursor-pointer touch-none", className)}
       role="slider"
       aria-label="Seek"
-      aria-valuenow={Math.round(progress)}
+      aria-valuenow={Math.round(dragging ? (dragPct / 100) * duration : progress)}
       aria-valuemin={0}
       aria-valuemax={Math.round(duration)}
       tabIndex={0}
+      onPointerDown={(e) => {
+        if (duration <= 0) return;
+        // never start the full-player pan gestures (cover carousel / dismiss)
+        e.stopPropagation();
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          /* stale pointer id — the move/up listeners below still work */
+        }
+        setDragPct(pctAt(e.clientX));
+      }}
+      onPointerMove={(e) => {
+        if (!dragging) return;
+        e.stopPropagation();
+        setDragPct(pctAt(e.clientX));
+      }}
+      onPointerUp={(e) => {
+        if (!dragging) return;
+        e.stopPropagation();
+        const p = dragPct;
+        setDragPct(null);
+        onSeek((p / 100) * duration);
+      }}
+      onPointerCancel={() => setDragPct(null)}
+      onKeyDown={(e) => {
+        if (duration <= 0) return;
+        if (e.key === "ArrowRight") {
+          e.preventDefault();
+          onSeek(Math.min(duration, progress + 5));
+        } else if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          onSeek(Math.max(0, progress - 5));
+        }
+      }}
     >
-      <div className={cn("absolute top-1/2 h-1 w-full -translate-y-1/2 rounded-full transition-all group-hover/bar:h-1.5", trackBg)}>
-        <div className={cn("h-full rounded-full transition-[width] duration-500 ease-linear", fillBg)} style={{ width: `${pct}%` }} />
-      </div>
+      {/* track — hairline at rest, grows on hover, thickest while dragging */}
       <div
-        className={cn("absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full opacity-0 shadow transition group-hover/bar:opacity-100", fillBg)}
-        style={{ left: `calc(${pct}% - 6px)` }}
+        className={cn(
+          "absolute top-1/2 w-full -translate-y-1/2 rounded-full transition-all",
+          dragging ? "h-2" : "h-1 group-hover/bar:h-1.5",
+          trackBg
+        )}
+      >
+        <div
+          className={cn("h-full rounded-full", fillBg)}
+          style={{ width: `${shown}%`, transition: dragging ? "none" : "width 500ms linear" }}
+        />
+      </div>
+      {/* live time bubble while dragging — YTM's scrub preview */}
+      {dragging && duration > 0 && (
+        <div
+          className="pointer-events-none absolute -top-8 z-10 -translate-x-1/2 rounded-md bg-black/85 px-2 py-0.5 text-[11px] font-bold tabular-nums text-white shadow-xl"
+          style={{ left: `clamp(16px, ${shown}%, calc(100% - 16px))` }}
+        >
+          {fmtTime((dragPct / 100) * duration)}
+        </div>
+      )}
+      {/* thumb — the grab-anywhere indicator */}
+      <div
+        className={cn(
+          "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full shadow-md transition-opacity transition-[width,height] duration-150",
+          fillBg,
+          dragging ? "h-4 w-4 opacity-100" : thumb === "always" ? "h-3.5 w-3.5 opacity-100" : "h-3 w-3 opacity-0 group-hover/bar:opacity-100"
+        )}
+        style={{ left: `clamp(8px, ${shown}%, calc(100% - 8px))` }}
       />
     </div>
   );
@@ -341,6 +411,9 @@ export function FullPlayer() {
   const nextCover = useCover(nextTrack);
   const [queueOpen, setQueueOpen] = useState(false);
   const [sheet, setSheet] = useState<"playlist" | "sleep" | "options" | null>(null);
+  // double-tap-to-seek feedback (artwork halves) — YouTube's ripple, ±10s
+  const [seekRipple, setSeekRipple] = useState<{ side: "back" | "fwd"; n: number } | null>(null);
+  const lastArtTap = useRef<{ t: number; side: "back" | "fwd" } | null>(null);
   const colors: [string, string] = pal ? [pal[0], pal[1]] : current?.colors ?? ["#15151f", "#08080d"];
 
   // swipe gestures — one channel per direction, driven by PURE PAN → motion values
@@ -387,6 +460,32 @@ export function FullPlayer() {
   useLayoutEffect(() => {
     carouselX.set(0);
   }, [current?.id, carouselX]);
+
+  // Android back button (APK): Wave's layers close first — ⋮ sheet → queue →
+  // full player — and only when everything is already closed does the native
+  // side minimize the app (music keeps playing, YTM's back behavior).
+  // MainActivity.onBackPressed calls window.__waveBack(); true = consumed.
+  useEffect(() => {
+    const w = window as unknown as { __waveBack?: () => boolean };
+    w.__waveBack = () => {
+      if (sheet) {
+        setSheet(null);
+        return true;
+      }
+      if (queueOpen) {
+        setQueueOpen(false);
+        return true;
+      }
+      if (expanded) {
+        setExpanded(false);
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      delete w.__waveBack;
+    };
+  }, [expanded, queueOpen, sheet, setExpanded]);
 
   return (
     <AnimatePresence>
@@ -532,7 +631,28 @@ export function FullPlayer() {
                   />
                 </motion.div>
               )}
-              <motion.div className="absolute inset-0" style={{ x: carouselX, willChange: "transform" }}>
+              <motion.div
+                className="absolute inset-0"
+                style={{ x: carouselX, willChange: "transform" }}
+                onTap={(_, info) => {
+                  // double-tap the artwork halves to skip ±10s (YouTube grammar):
+                  // left half = back, right half = forward. A single tap stays a
+                  // no-op, so nothing existing changes feel.
+                  const r = artSlotRef.current?.getBoundingClientRect();
+                  if (!r) return;
+                  const side: "back" | "fwd" = info.point.x > r.left + r.width / 2 ? "fwd" : "back";
+                  const now = Date.now();
+                  const last = lastArtTap.current;
+                  if (last && last.side === side && now - last.t < 350) {
+                    lastArtTap.current = null;
+                    const dur = current.duration > 0 ? current.duration : Number.MAX_SAFE_INTEGER;
+                    seek(Math.max(0, Math.min(dur, progress + (side === "fwd" ? 10 : -10))));
+                    setSeekRipple({ side, n: now });
+                  } else {
+                    lastArtTap.current = { t: now, side };
+                  }
+                }}
+              >
                 <Cover
                   from={colors[0]}
                   to={colors[1]}
@@ -542,6 +662,24 @@ export function FullPlayer() {
                   rounded="rounded-[28px]"
                   className={cn("aspect-square w-full shadow-2xl shadow-black/60 transition-transform duration-500", isPlaying ? "scale-100" : "scale-[0.88]")}
                 />
+                {/* ±10s ripple — fades over the art at the tapped half */}
+                <AnimatePresence>
+                  {seekRipple && (
+                    <motion.div
+                      key={seekRipple.n}
+                      initial={{ opacity: 0.9, scale: 0.6 }}
+                      animate={{ opacity: 0, scale: 1.25 }}
+                      transition={{ duration: 0.55, ease: "easeOut" }}
+                      onAnimationComplete={() => setSeekRipple(null)}
+                      className="pointer-events-none absolute inset-0 z-10 flex items-center"
+                      style={{ justifyContent: seekRipple.side === "fwd" ? "flex-end" : "flex-start" }}
+                    >
+                      <div className="m-6 flex h-16 w-16 items-center justify-center rounded-full bg-black/55 text-sm font-black text-white backdrop-blur-sm">
+                        {seekRipple.side === "fwd" ? "+10s" : "−10s"}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </motion.div>
             </div>
 
@@ -584,7 +722,7 @@ export function FullPlayer() {
 
             {/* expressive seek bar (shared with the desktop player bar) */}
             <div className="w-full max-w-xl">
-              <SeekArea progress={progress} duration={current ? (current.duration > 0 ? current.duration : 0) : 0} onSeek={seek} tone="light" className="h-8" />
+              <SeekArea progress={progress} duration={current ? (current.duration > 0 ? current.duration : 0) : 0} onSeek={seek} tone="light" thumb="always" className="h-8" />
               <div className="flex justify-between text-xs font-semibold tabular-nums text-white/60">
                 <span>{fmtTime(progress)}</span>
                 {/* right label = the CONSTANT total (never a remaining-time countdown) */}
@@ -620,7 +758,7 @@ export function FullPlayer() {
 
             {/* volume (desktop) */}
             <div className="hidden w-full max-w-xs items-center gap-3 sm:flex">
-              <button onClick={() => setVolume(volume === 0 ? 0.8 : 0)} aria-label="Mute">
+              <button onClick={() => setVolume(volume === 0 ? 1 : 0)} aria-label="Mute">
                 {volume === 0 ? <VolumeX className="h-4 w-4 text-white/60" /> : <Volume2 className="h-4 w-4 text-white/60" />}
               </button>
               <input
@@ -1074,9 +1212,44 @@ function QueueRow({ track, variant, onRemove, onPlayNext }: { track: QTrack; var
         whileDrag={{ scale: 1.02, backgroundColor: "#15151f", boxShadow: "0 16px 40px rgba(0,0,0,0.55)" }}
         className="rounded-xl"
       >
-        {row}
+        <SwipeDeleteRow onRemove={onRemove}>{row}</SwipeDeleteRow>
       </Reorder.Item>
     );
   }
   return row;
+}
+
+/**
+ * YTM's swipe-the-row-away delete — BOTH directions (user request), with the red
+ * reveal behind and the existing remove-with-Undo flow on release. Vertical
+ * scroll and the reorder handle are untouched (drag is x-locked; the handle
+ * stops propagation before the swipe ever sees it).
+ */
+function SwipeDeleteRow({ onRemove, children }: { onRemove?: () => void; children: React.ReactNode }) {
+  const x = useMotionValue(0);
+  const reveal = useTransform(x, (v) => Math.min(1, Math.abs(v) / 90));
+  if (!onRemove) return <>{children}</>;
+  return (
+    <div className="relative overflow-hidden rounded-xl">
+      <motion.div
+        style={{ opacity: reveal }}
+        className="pointer-events-none absolute inset-0 flex items-center justify-between bg-gradient-to-r from-red-500/85 via-red-500/55 to-red-500/85 px-5"
+      >
+        <Trash2 className="h-4 w-4 text-white" />
+        <Trash2 className="h-4 w-4 text-white" />
+      </motion.div>
+      <motion.div
+        drag="x"
+        style={{ x, willChange: "transform" }}
+        dragConstraints={{ left: 0, right: 0 }}
+        dragElastic={0.55}
+        dragSnapToOrigin
+        onDragEnd={(_, info) => {
+          if (Math.abs(info.offset.x) > 110 || Math.abs(info.velocity.x) > 650) onRemove();
+        }}
+      >
+        {children}
+      </motion.div>
+    </div>
+  );
 }

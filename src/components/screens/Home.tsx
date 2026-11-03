@@ -367,7 +367,7 @@ export function HomeScreen() {
       return;
     }
     setRadioPool(null);
-    radioApi(seedInfo.id)
+    radioApi(seedInfo.id, { title: seedInfo.title, artist: seedInfo.artist })
       .then((ts) => alive && setRadioPool(uniq(ts.filter((t) => t.id !== seedInfo.id))))
       .catch(() => alive && setRadioPool([]));
     return () => {

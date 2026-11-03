@@ -41,6 +41,8 @@
     "mini-services",
     "node_modules",
     "scripts",
-    "skills"
+    "skills",
+    "android",
+    "apkwork"
   ]
 }
