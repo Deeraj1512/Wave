@@ -17,8 +17,9 @@ const NAV_ITEMS = [
 ];
 
 /**
- * YTM's top chrome: wordmark left, a rounded search pill (desktop), mobile search
- * entry right. No utility icons — keyboard help stays on "?", Library lives in the rail.
+ * YTM's top chrome: wordmark left, a rounded search pill (desktop only).
+ * No corner utility icons — mobile reaches Search via the bottom nav tab,
+ * keyboard help stays on "?", Library lives in the rail.
  */
 export function TopBar({ screen, navigate }: { screen: Screen; navigate: (s: Screen) => void }) {
   const onSearchScreen = screen.name === "search";
@@ -44,19 +45,6 @@ export function TopBar({ screen, navigate }: { screen: Screen; navigate: (s: Scr
         </button>
       )}
       {onSearchScreen && <div className="mx-auto hidden flex-1 md:block" />}
-
-      <div className={cn("ml-auto flex shrink-0 items-center gap-1.5", !onSearchScreen && "md:ml-0")}>
-        {/* mobile search entry — YTM keeps search in the top bar on phones */}
-        {!onSearchScreen && (
-          <button
-            onClick={() => navigate({ name: "search" })}
-            aria-label="Search"
-            className="flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition hover:bg-surface-2 hover:text-foreground md:hidden"
-          >
-            <Search className="h-5 w-5" />
-          </button>
-        )}
-      </div>
     </header>
   );
 }
