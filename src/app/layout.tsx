@@ -1,13 +1,6 @@
 import type { Metadata, Viewport } from "next";
-import { Roboto } from "next/font/google";
 import { Toaster } from "@/components/ui/toaster";
 import "./globals.css";
-
-const roboto = Roboto({
-  variable: "--font-roboto",
-  subsets: ["latin"],
-  weight: ["400", "500", "700"],
-});
 
 export const metadata: Metadata = {
   title: "Wave — Your music, your language",
@@ -31,7 +24,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <body className={`${roboto.variable} min-h-screen bg-[var(--bg)] text-foreground antialiased`}>
+      <body className="min-h-screen bg-[var(--bg)] text-foreground antialiased">
         {children}
         <Toaster />
       </body>
