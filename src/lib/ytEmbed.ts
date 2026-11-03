@@ -25,8 +25,9 @@ type Handlers = {
 };
 
 interface YtPlayerInstance {
-  loadVideoById: (id: string) => void;
-  cueVideoById: (id: string) => void;
+  // object form carries startSeconds — the session-restore continue-at-second
+  loadVideoById: (arg: string | { videoId: string; startSeconds?: number }) => void;
+  cueVideoById: (arg: string | { videoId: string; startSeconds?: number }) => void;
   playVideo: () => void;
   pauseVideo: () => void;
   seekTo: (sec: number, allowSeekAhead: boolean) => void;
@@ -229,7 +230,7 @@ export async function ensure(): Promise<boolean> {
 }
 
 /** Load a video and autoplay it. Returns false if the engine isn't available. */
-export async function load(videoId: string, autoplay = true): Promise<boolean> {
+export async function load(videoId: string, autoplay = true, startSeconds = 0): Promise<boolean> {
   const ok = await ensure();
   const p = player;
   if (!ok || !p) return false;
@@ -241,7 +242,9 @@ export async function load(videoId: string, autoplay = true): Promise<boolean> {
   if (autoplay) {
     // Every load — including the very first — goes through loadVideoById. See the
     // note on createPlayer: the constructor-videoId path triggers spurious 150s.
-    p.loadVideoById(videoId);
+    // startSeconds > 0 = session-restore continue: the song picks up at the exact
+    // (gap-compensated) second instead of restarting from zero.
+    p.loadVideoById(startSeconds > 0 ? { videoId, startSeconds } : videoId);
     // loadVideoById often just cues in strict browsers — nudge playVideo; if still
     // blocked after ~4s, fall back to MUTED autoplay (always permitted). Sound
     // returns on the next real gesture via userGesture().
@@ -265,7 +268,7 @@ export async function load(videoId: string, autoplay = true): Promise<boolean> {
       // (-1) after two nudges, re-issue the load exactly once.
       if (tries === 3 && !reissued && st === -1) {
         reissued = true;
-        p.loadVideoById(videoId);
+        p.loadVideoById(startSeconds > 0 ? { videoId, startSeconds } : videoId);
       }
       if (tries > 6) {
         clearInterval(nudgeTimer!);
@@ -280,7 +283,7 @@ export async function load(videoId: string, autoplay = true): Promise<boolean> {
       p.playVideo();
     }, 700);
   } else {
-    p.cueVideoById(videoId);
+    p.cueVideoById(startSeconds > 0 ? { videoId, startSeconds } : videoId);
   }
   return true;
 }

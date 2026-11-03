@@ -674,12 +674,19 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }, 500);
   }, [tickProgress]);
 
+  /** the direct stream URL armed for the CURRENT track — the session save keeps it
+   *  so a reload re-arms the exact live URL (googlevideo URLs stay valid for hours
+   *  on the same IP) instead of paying a fresh resolve */
+  const streamUrlRef = useRef<{ id: string; url: string } | null>(null);
+
   const embedPlay = useCallback(
-    (track: Track) => {
+    (track: Track, opts?: { startAt?: number }) => {
+      const startAt = Math.max(0, Math.floor(opts?.startAt ?? 0));
       stopSim();
       // belt & suspenders: never let a lingering direct-engine stream double-play under us
       audioRef.current?.pause();
-      setProgressExact(0);
+      streamUrlRef.current = null; // the engine left the direct path — its saved URL is stale
+      setProgressExact(startAt);
       setPreviewLimited(false);
       setBuffering(true);
       setEngineBoth("embed");
@@ -744,7 +751,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         },
       });
       startProgressPoll();
-      ytEmbed.load(track.id, true).then((ok) => {
+      ytEmbed.load(track.id, true, startAt).then((ok) => {
         if (!ok && engineRef.current === "embed") skipOrFail();
         else if (ok) armEmbedWatchdog(track);
       });
@@ -756,7 +763,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   /** generation token — a stale `{once}` listener from a superseded load must never act */
   const directLoadSeqRef = useRef(0);
   const loadDirect = useCallback(
-    (track: Track, opts?: { startAt?: number; paused?: boolean; pauseOnDenied?: boolean; restored?: boolean }) => {
+    (track: Track, opts?: { startAt?: number; paused?: boolean; pauseOnDenied?: boolean; restored?: boolean; directUrl?: string }) => {
       const startAt = Math.max(0, Math.floor(opts?.startAt ?? 0));
       const paused = opts?.paused ?? false;
       const pauseOnDenied = opts?.pauseOnDenied ?? false;
@@ -779,10 +786,23 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           directTimerRef.current = null;
         }
         if (restored) {
-          // hold the restored song — one play tap re-resolves fresh
           a.pause();
-          setBuffering(false);
-          setIsPlaying(false);
+          if (paused) {
+            // restored-paused: hold — the song wasn't playing; one tap resumes it
+            // at the saved second. Re-assert the display: the failed arm means no
+            // metadata ever landed, so a stray timeupdate would re-anchor to 0.
+            setProgressExact(startAt);
+            setBuffering(false);
+            setIsPlaying(false);
+            return;
+          }
+          // restored PLAYING (refresh / cold start): the song must NOT stop — the
+          // embed engine picks the track up at the gap-compensated second. If the
+          // fresh page denies sound, the embed falls back to muted autoplay (always
+          // permitted) so the counter keeps flowing; the first tap restores audio.
+          // (This used to park the song because the embed could only restart from
+          // zero — load() now accepts startSeconds.)
+          embedPlay(track, { startAt });
           return;
         }
         // CRITICAL: the direct stream may still be live (slow resolve that lands late).
@@ -816,6 +836,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
       /** attach the listener contract + stall timer + start playback (shared by both runtimes) */
       const arm = (src: string, onErr: () => void) => {
+        streamUrlRef.current = { id: track.id, url: src };
         a.addEventListener("loadedmetadata", onLoaded, { once: true });
         a.addEventListener("error", onErr, { once: true });
         if (paused) {
@@ -831,16 +852,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         directTimerRef.current = setTimeout(flipToEmbed, 4000);
         a.src = src;
         a.play().catch((err: unknown) => {
-          // session auto-resume denied by the browser's autoplay policy — hold
-          // everything at the saved second, paused; NEVER flip to embed here
-          // (a muted iframe would restart the song from zero)
           if (pauseOnDenied && (err as DOMException | undefined)?.name === "NotAllowedError") {
-            if (directTimerRef.current) {
-              clearTimeout(directTimerRef.current);
-              directTimerRef.current = null;
-            }
-            setBuffering(false);
-            setIsPlaying(false);
+            // autoplay policy denied the fresh page — don't PARK the song: the
+            // embed continues at the same second (muted if it must; the first tap
+            // restores sound) so the counter never freezes on a refresh
+            flipToEmbed();
             return;
           }
           /* autoplay rejection or network error → error/timeout path handles it */
@@ -860,6 +876,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       // buffer; on a mid-load refusal (native) we re-resolve ONCE.
       let settled = false;
       let retried = false;
+      // true when the armed src came from the session save (a pre-reload URL) —
+      // such a URL is allowed ONE fresh re-resolve on web too before the embed
+      const armedFromSaved = Boolean(opts?.directUrl);
       const isLive = () => !settled && directLoadSeqRef.current === mySeq && engineRef.current === "direct";
       const deadline = setTimeout(() => {
         if (isLive()) {
@@ -873,17 +892,27 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         arm(src, onErr);
       };
       // Terminal fallback for BOTH runtimes is the embed engine (flipToEmbed
-      // honours `restored` by holding the song instead of embedding).
+      // continues a restored PLAYING session at its second; it only HOLDS a
+      // restored-paused one).
       const onErrDirect = () => {
         if (directLoadSeqRef.current !== mySeq) return;
-        if (retried || !IS_NATIVE) return flipToEmbed();
+        if (retried) return flipToEmbed();
+        // one re-resolve, then the embed: NATIVE re-mints from this device's IP;
+        // WEB retries the proxy only when the FAILED arm was a SAVED session URL
+        // (a fresh proxy failure is terminal — CORS forbids the in-process chain)
+        if (!armedFromSaved && !IS_NATIVE) return flipToEmbed();
         retried = true;
         void (async () => {
           try {
-            await invalidateNativeAudio(track.id);
-            const again = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);
-            if (directLoadSeqRef.current !== mySeq || engineRef.current !== "direct") return;
-            if (again) return armDirect(again.url, onErrDirect);
+            if (IS_NATIVE) {
+              await invalidateNativeAudio(track.id);
+              const again = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);
+              if (directLoadSeqRef.current !== mySeq || engineRef.current !== "direct") return;
+              if (again) return armDirect(again.url, onErrDirect);
+            } else {
+              armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration), onErrDirect);
+              return;
+            }
           } catch {
             /* re-resolve refused — embed takes over */
           }
@@ -892,6 +921,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       };
       void (async () => {
         try {
+          if (opts?.directUrl) {
+            // INSTANT CONTINUE (refresh / cold start): re-arm the exact stream URL
+            // that was live before the page went away — playback restarts in well
+            // under a second instead of paying a fresh resolve. An expired URL
+            // falls into onErrDirect's one-shot re-resolve.
+            settled = true;
+            armDirect(opts.directUrl, onErrDirect);
+            return;
+          }
           if (!IS_NATIVE) {
             // WEB: the proxy IS the resolve path (CORS forbids the in-process chain)
             settled = true;
@@ -1251,7 +1289,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const a = audioRef.current;
     if (!a) return;
     const onTime = () => {
-      if (engineRef.current === "direct") tickProgress(a.currentTime);
+      // readyState gate: before metadata lands (HAVE_METADATA) currentTime is a
+      // meaningless 0 — a load that dies (502/reset) still emits a trailing
+      // timeupdate, which would clobber a restored session's displayed second
+      if (engineRef.current === "direct" && a.readyState >= 1) tickProgress(a.currentTime);
     };
     const onEnded = () => {
       if (engineRef.current === "direct") trackEndRef.current();
@@ -1410,11 +1451,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ── playback session persistence (refresh + cold start) ────────────────────
-  // A refresh (or relaunch) must never lose the moment: queue, exact position
-  // and whether music was playing are saved continuously and restored on load —
-  // with AUTO-RESUME (user request). The APK's WebView always resumes audibly;
-  // desktop browsers without media engagement come back paused at the same
-  // second (pauseOnDenied keeps the engine from flipping to a muted embed).
+  // A refresh (or relaunch) must never lose the MOMENT or the FLOW: queue,
+  // exact position, the live stream URL and whether music was playing are saved
+  // continuously and restored on load. A session that was PLAYING continues
+  // playing — the reload's downtime is folded into the resume position (capped)
+  // so the counter picks up AHEAD of where the refresh caught it, and a browser
+  // that denies sound falls back to the embed's muted autoplay (the first tap
+  // restores audio) instead of parking the song. Only a session that was PAUSED
+  // returns paused, still holding its exact second.
   const SESSION_KEY = "dhun.session";
   const sessionSave = useCallback(() => {
     const cur = currentRef.current;
@@ -1429,8 +1473,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           queue: q.slice(0, 300),
           index: queueIndexRef.current,
           playingFrom: playingFromRef.current,
-          position: readPosition(),
+          position: readPosition() || shownSecRef.current,
           playing: isPlayingRef.current,
+          // the exact live stream URL of the CURRENT track (direct engine only,
+          // guarded by track id) — restore re-arms it instantly instead of
+          // paying a fresh resolve, so the song comes back without a gap
+          streamUrl:
+            engineRef.current === "direct" && streamUrlRef.current?.id === cur.id
+              ? streamUrlRef.current.url
+              : null,
         })
       );
     } catch {
@@ -1463,7 +1514,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (restoredRef.current) return;
     restoredRef.current = true;
-    let s: { v?: number; queue?: QTrack[]; index?: number; playingFrom?: string | null; position?: number; playing?: boolean } | null = null;
+    let s: { v?: number; at?: number; queue?: QTrack[]; index?: number; playingFrom?: string | null; position?: number; playing?: boolean; streamUrl?: unknown } | null = null;
     try {
       s = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null");
     } catch {
@@ -1475,18 +1526,29 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const t = q[idx];
     if (!t?.id) return;
     const pos = Math.max(0, Number(s.position) || 0);
+    // THE FLOW RULE (user request): a refresh must never stop, rewind or restart
+    // the song — the counter keeps advancing as if the audio never died. The
+    // wall-clock time since the last save is folded into the resume position
+    // (capped), so the reload's downtime is swallowed: the song comes back
+    // AHEAD of where the refresh caught it. Past the cap (the app sat closed
+    // for a while) it continues from the exact saved second instead of
+    // skipping minutes.
+    const GAP_LIMIT_S = 30;
+    const elapsed = s.playing && s.at ? (Date.now() - Number(s.at)) / 1000 : 0;
+    const gap = elapsed > 0.5 && elapsed < GAP_LIMIT_S ? Math.floor(elapsed) : 0;
+    const resumeAt = pos + gap;
+    const savedUrl = typeof s.streamUrl === "string" && s.streamUrl.length > 0 ? s.streamUrl : undefined;
     // the queue-index effect must not re-fire loadAndPlay over the restore
     pendingRef.current = true;
     loadedIdRef.current = t.id;
     setQueue(q);
     setQueueIndex(idx);
     setPlayingFrom(s.playingFrom ?? null);
-    setProgressExact(pos);
-    if (s.playing) loadDirect(t, { startAt: pos, pauseOnDenied: true, restored: true });
-    else loadDirect(t, { startAt: pos, paused: true, restored: true });
-    // loadDirect re-anchors progress to 0 — restore the saved position AFTER it
+    if (s.playing) loadDirect(t, { startAt: resumeAt, pauseOnDenied: true, restored: true, directUrl: savedUrl });
+    else loadDirect(t, { startAt: pos, paused: true, restored: true, directUrl: savedUrl });
+    // loadDirect re-anchors progress to 0 — restore the position AFTER it
     // (the element itself re-seeks on loadedmetadata; this fixes the DISPLAY)
-    setProgressExact(pos);
+    setProgressExact(s.playing ? resumeAt : pos);
   }, []);
 
   const readDuration = useCallback(() => {
