@@ -17,13 +17,15 @@
   --color-surface-raised: var(--surface-raised);
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
-  --font-sans: var(--font-roboto), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: Roboto, ui-sans-serif, system-ui, sans-serif;
 }
 
 /*
   ── Wave design language: YouTube Music, verbatim ─────────────────────────
   #030303 canvas, #212121 surfaces, monochrome white accent (red reserved for
-  the brand dot), Roboto everywhere. No custom touches.
+  the brand dot), Roboto everywhere. No custom touches. Roboto resolves as the
+  OS system font on Android (the APK/web-app surface) — no webfont download,
+  so the build never depends on Google Fonts being reachable in CI.
 */
 :root {
   --bg: #030303;
@@ -57,7 +59,7 @@ body {
 }
 
 body {
-  font-family: var(--font-roboto), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-family: Roboto, ui-sans-serif, system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
