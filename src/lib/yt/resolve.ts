@@ -115,7 +115,14 @@ async function probe(url: string, ua: string, contentLength?: number): Promise<P
 }
 
 export async function resolveStream(videoId: string, opts: { allowPreview?: boolean; forceRefresh?: boolean } = {}): Promise<ResolvedStream | null> {
-  await sessionReady();
+  // Bootstrap failure (bot wall / offline) is "resolve unavailable", not a crash —
+  // callers drop to the sibling fallback / next engine.
+  try {
+    await sessionReady();
+  } catch {
+    chainDebug = [{ client: "session", status: "unavailable" }];
+    return null;
+  }
   chainDebug = [];
 
   if (!opts.forceRefresh) {

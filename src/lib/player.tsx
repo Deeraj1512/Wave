@@ -2,7 +2,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
-import { audioUrlFor, radioApi, searchApi } from "./api";
+import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio } from "./api";
+import { notifyPlayState } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import * as ytEmbed from "./ytEmbed";
@@ -316,7 +317,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const [shuffle, setShuffle] = useState(false);
   const [repeat, setRepeat] = useState<RepeatMode>(0);
   const [sleepTimer, setSleepTimerState] = useState<SleepTimerState>(null);
-  const [volume, setVolumeState] = useState(0.8);
+  // Volume defaults to MAX (user request) and remembers the user's own choice.
+  const [volume, setVolumeState] = useState(() => {
+    if (typeof window === "undefined") return 1;
+    try {
+      const v = Number(localStorage.getItem("dhun.volume"));
+      return Number.isFinite(v) && v > 0 && v <= 1 ? v : 1;
+    } catch {
+      return 1;
+    }
+  });
   const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
   /** full track snapshots for liked ids (many liked ids are live videoIds not in any catalog) */
   const [likedTracks, setLikedTracks] = useState<Track[]>([]);
@@ -328,12 +338,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const engineRef = useRef<Engine>("direct");
-  const embedPreferredRef = useRef(false);
   const simTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const simModeRef = useRef(false);
   const pendingRef = useRef(false); // whether a load is in flight for the current track
   const loadedIdRef = useRef<string | null>(null); // id of the track playback was started for
   const volumeRef = useRef(volume);
+  const playingFromRef = useRef<string | null>(null);
   const directTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const uidSeqRef = useRef(0);
@@ -395,24 +405,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     isPlayingRef.current = isPlaying;
   });
 
-  // One-time capability probe at app load: if this server can't mint googlevideo URLs
-  // (bot-gated IP), prefer the embed engine from the very first play — no 4s direct timeout.
+  // Warm-up at app load: the YT IFrame API (embed fallback) plus the on-device Echo
+  // resolve chunk, so the first play never pays the dynamic-module load cost.
+  // (The old /api/stream-health probe is gone: the server no longer mints URLs —
+  // the CLIENT does — so a bot-gated deployment IP must not steer the engine choice.)
   useEffect(() => {
-    let alive = true;
-    // warm the YT IFrame API script so the first play doesn't wait on it
     ytEmbed.prewarmApi();
-    fetch("/api/stream-health")
-      .then((r) => r.json())
-      .then((d: { engine?: string }) => {
-        if (alive && d?.engine === "embed") {
-          embedPreferredRef.current = true;
-          if (typeof window !== "undefined") (window as any).__dhunPreflight = "embed";
-        }
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
+    void import("./yt/resolve").catch(() => {});
   }, []);
 
   const setEngineBoth = useCallback((m: Engine) => {
@@ -426,6 +425,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     if (!audioRef.current) {
       const a = new Audio();
       a.preload = "auto";
+      // Background-play bridge (APK): the native foreground service follows the
+      // element's audible state so Android never freezes the process mid-song.
+      // On web notifyPlayState is a no-op.
+      a.addEventListener("playing", () => notifyPlayState(true));
+      a.addEventListener("pause", () => notifyPlayState(false));
+      a.addEventListener("ended", () => notifyPlayState(false));
       audioRef.current = a;
     }
     return audioRef.current;
@@ -700,6 +705,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             }
             setBuffering(false);
             setIsPlaying(true);
+            notifyPlayState(true);
             stopSim();
             // the iframe's own session just (re)claimed audio focus — re-take the
             // OS card for Wave's session (freshest audible media wins)
@@ -707,6 +713,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           } else if (s === "paused") {
             // a deliberate pause is healthy playback — stand down the failure watchdog
             setIsPlaying(false);
+            notifyPlayState(false);
             if (embedWatchdogRef.current) {
               clearTimeout(embedWatchdogRef.current);
               embedWatchdogRef.current = null;
@@ -718,6 +725,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             // instead of spinning on "buffering…" forever. It disarms on playing/paused.
             armEmbedWatchdog(track);
           } else if (s === "ended") {
+            notifyPlayState(false);
             trackEndRef.current();
           }
         },
@@ -748,14 +756,19 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   /** generation token — a stale `{once}` listener from a superseded load must never act */
   const directLoadSeqRef = useRef(0);
   const loadDirect = useCallback(
-    (track: Track) => {
+    (track: Track, opts?: { startAt?: number; paused?: boolean; pauseOnDenied?: boolean; restored?: boolean }) => {
+      const startAt = Math.max(0, Math.floor(opts?.startAt ?? 0));
+      const paused = opts?.paused ?? false;
+      const pauseOnDenied = opts?.pauseOnDenied ?? false;
+      // restored sessions never auto-skip or muted-embed on total engine failure —
+      // the song the user last heard STAYS on screen exactly where they left it
+      const restored = opts?.restored ?? false;
       stopSim();
       setEngineBoth("direct");
       setProgressExact(0);
       setPreviewLimited(false);
       setBuffering(true);
       const a = getAudio();
-      a.src = audioUrlFor(track.id, track.title, track.artist, track.duration);
       a.volume = volumeRef.current;
       const mySeq = ++directLoadSeqRef.current;
 
@@ -765,7 +778,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           clearTimeout(directTimerRef.current);
           directTimerRef.current = null;
         }
-        embedPreferredRef.current = true;
+        if (restored) {
+          // hold the restored song — one play tap re-resolves fresh
+          a.pause();
+          setBuffering(false);
+          setIsPlaying(false);
+          return;
+        }
         // CRITICAL: the direct stream may still be live (slow resolve that lands late).
         // Pause it BEFORE the embed starts or both play at once — the classic glitch.
         a.pause();
@@ -778,6 +797,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           directTimerRef.current = null;
         }
         setBuffering(false);
+        // session-restore position — clamp inside the element's real length
+        if (startAt > 0 && Number.isFinite(a.duration) && a.duration > 0) {
+          try {
+            a.currentTime = Math.min(startAt, Math.max(0, a.duration - 1));
+          } catch {
+            /* a mid-load seek can throw — the song just starts from 0 */
+          }
+        }
         // duration truth-sync (same contract as the embed poll): the element's real
         // length is adopted the moment metadata lands — loadedmetadata fires before
         // playback — so the total is exact from the first tick and never flips mid-track
@@ -786,16 +813,104 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           setQueue((q) => q.map((t) => (t.id === track.id ? { ...t, duration: Math.round(a.duration) } : t)));
         }
       };
-      const onErr = () => flipToEmbed();
 
-      a.addEventListener("loadedmetadata", onLoaded, { once: true });
-      a.addEventListener("error", onErr, { once: true });
-      // if resolution is dragging (bot-gate + sibling search), switch to embed after 4s
-      if (directTimerRef.current) clearTimeout(directTimerRef.current);
-      directTimerRef.current = setTimeout(flipToEmbed, 4000);
-      a.play().catch(() => {
-        /* autoplay rejection or network error → error/timeout path handles it */
-      });
+      /** attach the listener contract + stall timer + start playback (shared by both runtimes) */
+      const arm = (src: string, onErr: () => void) => {
+        a.addEventListener("loadedmetadata", onLoaded, { once: true });
+        a.addEventListener("error", onErr, { once: true });
+        if (paused) {
+          // session restore (was paused): arm the source at the saved position,
+          // but never autoplay and never run the stall timer — the mini player
+          // simply shows the song, one tap from continuing
+          a.src = src;
+          setBuffering(false);
+          setIsPlaying(false);
+          return;
+        }
+        if (directTimerRef.current) clearTimeout(directTimerRef.current);
+        directTimerRef.current = setTimeout(flipToEmbed, 4000);
+        a.src = src;
+        a.play().catch((err: unknown) => {
+          // session auto-resume denied by the browser's autoplay policy — hold
+          // everything at the saved second, paused; NEVER flip to embed here
+          // (a muted iframe would restart the song from zero)
+          if (pauseOnDenied && (err as DOMException | undefined)?.name === "NotAllowedError") {
+            if (directTimerRef.current) {
+              clearTimeout(directTimerRef.current);
+              directTimerRef.current = null;
+            }
+            setBuffering(false);
+            setIsPlaying(false);
+            return;
+          }
+          /* autoplay rejection or network error → error/timeout path handles it */
+        });
+      };
+
+      // Runtime split (api.ts's contract):
+      //  - WEB: a browser cannot talk to youtubei in-process — music.youtube.com
+      //    sends no CORS headers, so every Echo-chain fetch dies with TypeError
+      //    "Failed to fetch" (the crash the preview showed). The same-origin
+      //    server proxy /api/audio runs the identical chain server-side and
+      //    streams its result; the embed engine stays the last resort.
+      //  - NATIVE: CapacitorHttp patches fetch to native HTTP — no CORS. The
+      //    Echo chain runs in-process and mints the URL from THIS device's IP,
+      //    so the <audio> element plays googlevideo directly (no proxy hop).
+      // A resolve deadline keeps a worst-case gated chain from stalling on
+      // buffer; on a mid-load refusal (native) we re-resolve ONCE.
+      let settled = false;
+      let retried = false;
+      const isLive = () => !settled && directLoadSeqRef.current === mySeq && engineRef.current === "direct";
+      const deadline = setTimeout(() => {
+        if (isLive()) {
+          settled = true;
+          flipToEmbed();
+        }
+      }, 8000);
+      const armDirect = (src: string, onErr: () => void) => {
+        if (directLoadSeqRef.current !== mySeq) return;
+        clearTimeout(deadline);
+        arm(src, onErr);
+      };
+      // Terminal fallback for BOTH runtimes is the embed engine (flipToEmbed
+      // honours `restored` by holding the song instead of embedding).
+      const onErrDirect = () => {
+        if (directLoadSeqRef.current !== mySeq) return;
+        if (retried || !IS_NATIVE) return flipToEmbed();
+        retried = true;
+        void (async () => {
+          try {
+            await invalidateNativeAudio(track.id);
+            const again = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);
+            if (directLoadSeqRef.current !== mySeq || engineRef.current !== "direct") return;
+            if (again) return armDirect(again.url, onErrDirect);
+          } catch {
+            /* re-resolve refused — embed takes over */
+          }
+          flipToEmbed();
+        })();
+      };
+      void (async () => {
+        try {
+          if (!IS_NATIVE) {
+            // WEB: the proxy IS the resolve path (CORS forbids the in-process chain)
+            settled = true;
+            armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration), onErrDirect);
+            return;
+          }
+          const stream = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);
+          if (!isLive()) return; // superseded, or the deadline already flipped to embed
+          settled = true;
+          if (!stream) return flipToEmbed();
+          armDirect(stream.url, onErrDirect);
+        } catch {
+          // resolve must never take the app down — embed engine (or hold) takes over
+          if (isLive()) {
+            settled = true;
+            flipToEmbed();
+          }
+        }
+      })();
     },
     [getAudio, embedPlay, stopSim, setEngineBoth, setProgressExact]
   );
@@ -845,8 +960,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         loadedIdRef.current = t.id;
         // log to listening history (drives the personalized home feed) — real id when resolved
         recordPlay({ id: t.id, title: t.title, artist: t.artist, cover: t.cover });
-        if (embedPreferredRef.current) embedPlay(t);
-        else loadDirect(t);
+        loadDirect(t);
       })();
     },
     [embedPlay, loadDirect]
@@ -881,19 +995,56 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     setRadioLoading(true);
     const run = (async () => {
       try {
-        const pool = await radioApi(seedTrack.id);
-        const shaped = await shapeForMode(mode, pool, seedTrack);
-        const ranked = shaped.length > 0 ? shaped : pool; // a flavor that yields nothing must never kill playback
+        let pool: Track[] = [];
+        try {
+          pool = await radioApi(seedTrack.id, { title: seedTrack.title, artist: seedTrack.artist });
+        } catch {
+          pool = []; // Mix endpoint hard-down (5xx / timeout) — the search fallback below answers
+        }
+        let ranked = pool;
+        if (pool.length > 0) {
+          const shaped = await shapeForMode(mode, pool, seedTrack);
+          ranked = shaped.length > 0 ? shaped : pool; // a flavor that yields nothing must never kill playback
+        }
         const haveBases = new Set(q.map((x) => baseTitle(x.title))); // blocks the same song in another language
-        const add = relateBlock(seedTrack, ranked)
-          .filter((t) => {
-            if (t.id === seedTrack.id || q.some((x) => x.id === t.id)) return false;
-            const tb = baseTitle(t.title);
-            return !haveBases.has(tb);
-          })
-          .slice(0, 15)
-          .map((t) => ({ ...t, uid: `r:${t.id}:${uidSeqRef.current++}`, layer: "radio" as const }));
-        if (add.length === 0) return false;
+        const build = (src: Track[]) =>
+          relateBlock(seedTrack, src)
+            .filter((t) => {
+              if (t.id === seedTrack.id || q.some((x) => x.id === t.id)) return false;
+              const tb = baseTitle(t.title);
+              return !haveBases.has(tb);
+            })
+            .slice(0, 15)
+            .map((t) => ({ ...t, uid: `r:${t.id}:${uidSeqRef.current++}`, layer: "radio" as const }));
+        let add = build(ranked);
+        if (add.length === 0) {
+          // AUTOPLAY GUARANTEE (client net): the Mix endpoint is the most-gated InnerTube
+          // surface — when it 5xxes or filters to zero, rebuild the block from search
+          // (radioFor has a server-side fallback; this covers the route being down too).
+          const artistFirst = seedTrack.artist.split(",")[0].trim();
+          const lang = detectTrackLang(seedTrack);
+          const queries = [
+            artistFirst.length > 2 ? `${artistFirst} songs` : "",
+            lang ? `${lang.toLowerCase()} hit songs` : "",
+          ].filter(Boolean);
+          const settled = await Promise.allSettled(queries.map((squery) => searchApi(squery)));
+          const fb: Track[] = [];
+          const fbSeen = new Set<string>();
+          for (const s of settled) {
+            if (s.status !== "fulfilled") continue;
+            for (const t of s.value) {
+              if (!fbSeen.has(t.id)) {
+                fbSeen.add(t.id);
+                fb.push(t);
+              }
+            }
+          }
+          add = build(fb);
+        }
+        if (add.length === 0) {
+          radioTriedRef.current.delete(key); // even search came up dry — end-of-line may retry
+          return false;
+        }
         setQueue((prev) => {
           if (radioEpochRef.current !== epoch) return prev; // mode/context changed mid-fetch — discard
           const have = new Set(prev.map((x) => x.id));
@@ -1146,9 +1297,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const a = getAudio();
+    if (a.error) {
+      // dead element (failed load / restored session on a gated network) — a.play()
+      // on it is a silent no-op forever; resolve a fresh stream instead
+      const cur = currentRef.current;
+      if (cur) {
+        loadDirect(cur);
+        return;
+      }
+    }
     if (a.paused) a.play().catch(() => {});
     else a.pause();
-  }, [getAudio, startSim, clearSimTick]);
+  }, [getAudio, startSim, clearSimTick, loadDirect]);
 
   // reflect audio play/pause into isPlaying (direct engine)
   useEffect(() => {
@@ -1214,6 +1374,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     (v: number) => {
       setVolumeState(v);
       volumeRef.current = v;
+      try {
+        localStorage.setItem("dhun.volume", String(v));
+      } catch {
+        /* private mode */
+      }
       const a = getAudio();
       a.volume = v;
       ytEmbed.setVolume(v);
@@ -1242,6 +1407,86 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     if (engineRef.current === "sim") return simProgressRef.current;
     if (engineRef.current === "embed") return ytEmbed.getTime();
     return audioRef.current?.currentTime ?? 0;
+  }, []);
+
+  // ── playback session persistence (refresh + cold start) ────────────────────
+  // A refresh (or relaunch) must never lose the moment: queue, exact position
+  // and whether music was playing are saved continuously and restored on load —
+  // with AUTO-RESUME (user request). The APK's WebView always resumes audibly;
+  // desktop browsers without media engagement come back paused at the same
+  // second (pauseOnDenied keeps the engine from flipping to a muted embed).
+  const SESSION_KEY = "dhun.session";
+  const sessionSave = useCallback(() => {
+    const cur = currentRef.current;
+    const q = queueRef.current;
+    if (!cur || q.length === 0) return;
+    try {
+      localStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify({
+          v: 1,
+          at: Date.now(),
+          queue: q.slice(0, 300),
+          index: queueIndexRef.current,
+          playingFrom: playingFromRef.current,
+          position: readPosition(),
+          playing: isPlayingRef.current,
+        })
+      );
+    } catch {
+      /* private mode / quota — playback never depends on the session */
+    }
+  }, [readPosition]);
+
+  // keep the playingFrom mirror current for the session payload
+  useEffect(() => {
+    playingFromRef.current = playingFrom;
+  }, [playingFrom]);
+
+  // save triggers: a 5s heartbeat while playing + the moment the page hides
+  useEffect(() => {
+    const beat = setInterval(sessionSave, 5000);
+    const onHide = () => {
+      if (document.visibilityState === "hidden") sessionSave();
+    };
+    window.addEventListener("pagehide", sessionSave);
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      clearInterval(beat);
+      window.removeEventListener("pagehide", sessionSave);
+      document.removeEventListener("visibilitychange", onHide);
+    };
+  }, [sessionSave]);
+
+  // restore — runs once per page load, straight into the direct engine
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    let s: { v?: number; queue?: QTrack[]; index?: number; playingFrom?: string | null; position?: number; playing?: boolean } | null = null;
+    try {
+      s = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null");
+    } catch {
+      s = null;
+    }
+    const q = s?.queue;
+    if (!s || s.v !== 1 || !Array.isArray(q) || q.length === 0) return;
+    const idx = Math.min(Math.max(0, Math.floor(s.index ?? 0)), q.length - 1);
+    const t = q[idx];
+    if (!t?.id) return;
+    const pos = Math.max(0, Number(s.position) || 0);
+    // the queue-index effect must not re-fire loadAndPlay over the restore
+    pendingRef.current = true;
+    loadedIdRef.current = t.id;
+    setQueue(q);
+    setQueueIndex(idx);
+    setPlayingFrom(s.playingFrom ?? null);
+    setProgressExact(pos);
+    if (s.playing) loadDirect(t, { startAt: pos, pauseOnDenied: true, restored: true });
+    else loadDirect(t, { startAt: pos, paused: true, restored: true });
+    // loadDirect re-anchors progress to 0 — restore the saved position AFTER it
+    // (the element itself re-seeks on loadedmetadata; this fixes the DISPLAY)
+    setProgressExact(pos);
   }, []);
 
   const readDuration = useCallback(() => {
@@ -1404,7 +1649,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         setRadioLoading(true);
         const run = (async (): Promise<boolean> => {
           try {
-            const tracks = await radioApi(t.id);
+            const tracks = await radioApi(t.id, { title: t.title, artist: t.artist });
             const exclude = new Set(queueRef.current.map((x) => x.id));
             const add = tracks
               .filter((x) => !exclude.has(x.id) && x.id !== t.id)

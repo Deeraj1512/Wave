@@ -8,25 +8,43 @@
  *  - prettyPrint=false, X-Goog-Api-Format-Version=1, X-Origin/Referer music.youtube.com
  *  - context.visitorData must match the X-Goog-Visitor-Id header
  */
-import { createHash } from "node:crypto";
+/**
+ * Isomorphic by design: this module runs on the Node server (web deployment)
+ * AND inside the Android WebView (APK build) — the ONLY remaining platform fork
+ * is the optional COOKIE login path, which simply no-ops on the client.
+ *
+ * ⚠ RUNTIME RULE: music.youtube.com sends NO CORS headers, so in a plain browser
+ * every fetch here dies with TypeError "Failed to fetch". Browsers must consume
+ * this chain through the same-origin /api proxy — only the Capacitor shell
+ * (CapacitorHttp patches fetch to native HTTP, no CORS) may run it in-process.
+ */
 import { API_YTM, INNERTUBE_KEY, ORIGIN_YTM, WEB_REMIX, type InnertubeClient } from "./clients";
 
 const GL = "IN";
 const HL = "en";
 
+/** SHA-1 via WebCrypto — works in Node (>=15) and browsers alike, no node:crypto. */
+async function sha1Hex(input: string): Promise<string> {
+  const dig = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(dig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 /**
  * Optional logged-in session (Echo's setLogin path): a burner-account YTM cookie dramatically
  * reduces bot-gating on datacenter IPs. Echo appends SAPISIDHASH Authorization for
- * loginSupported clients — ported here. Set COOKIE in .env to enable.
+ * loginSupported clients — ported here. Set COOKIE in .env to enable (server only;
+ * the APK client has no cookie and skips straight to the tokenless mobile catalog).
  */
-function loginHeaders(): Record<string, string> {
-  const cookie = process.env.COOKIE?.trim();
+async function loginHeaders(): Promise<Record<string, string>> {
+  const cookie = (typeof process !== "undefined" ? process.env?.COOKIE : undefined)?.trim();
   if (!cookie) return {};
   const h: Record<string, string> = { Cookie: cookie };
   const sap = cookie.match(/SAPISID=([^;]+)/)?.[1];
   if (sap) {
     const t = Math.floor(Date.now() / 1000);
-    const hash = createHash("sha1").update(`${t} ${sap} ${ORIGIN_YTM}`).digest("hex");
+    const hash = await sha1Hex(`${t} ${sap} ${ORIGIN_YTM}`);
     h["Authorization"] = `SAPISIDHASH ${t}_${hash}`;
   }
   return h;
@@ -34,28 +52,55 @@ function loginHeaders(): Record<string, string> {
 
 let visitorData: string | null = null;
 let visitorFetchedAt = 0;
+let visitorFailedAt = 0;
 const VISITOR_TTL = 12 * 60 * 60 * 1000; // 12h
+const VISITOR_FAIL_TTL = 60 * 1000; // after a dead bootstrap, fail fast for 60s
 
-export function getVisitorData(): string | null {
-  return visitorData && Date.now() - visitorFetchedAt < VISITOR_TTL ? visitorData : visitorData;
+/** The bootstrap network is dead (bot wall / offline / CORS) — callers treat this as
+ *  "resolve is unavailable" and drop to the next engine instead of crashing. */
+export class SessionUnavailable extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "SessionUnavailable";
+  }
 }
 
-/** Bootstrap: fetch music.youtube.com and scrape visitorData + live WEB_REMIX version. */
+export function getVisitorData(): string | null {
+  return visitorData;
+}
+
+/**
+ * Bootstrap: fetch music.youtube.com and scrape visitorData + live WEB_REMIX version.
+ * Network-proof by contract: a failed bootstrap is negative-cached for 60s (no doomed
+ * fetch on every play attempt) and, when a stale visitorData exists, served best-effort
+ * instead of thrown — the chain degrades to null, never to an unhandled rejection.
+ */
 export async function ensureSession(force = false): Promise<string> {
   if (!force && visitorData && Date.now() - visitorFetchedAt < VISITOR_TTL) return visitorData;
-  const res = await fetch(ORIGIN_YTM + "/", {
-    headers: { "User-Agent": WEB_REMIX.userAgent, "Accept-Language": "en-IN,en;q=0.9" },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error(`bootstrap ${res.status}`);
-  const html = await res.text();
-  const v = html.match(/"visitorData":"([^"]+)"/)?.[1];
-  const live = html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/)?.[1];
-  if (live) WEB_REMIX.version = live;
-  if (!v) throw new Error("visitorData not found in bootstrap");
-  visitorData = v;
-  visitorFetchedAt = Date.now();
-  return v;
+  if (!force && visitorFailedAt && Date.now() - visitorFailedAt < VISITOR_FAIL_TTL) {
+    if (visitorData) return visitorData; // stale beats dead
+    throw new SessionUnavailable("bootstrap unavailable (recent failure)");
+  }
+  try {
+    const res = await fetch(ORIGIN_YTM + "/", {
+      headers: { "User-Agent": WEB_REMIX.userAgent, "Accept-Language": "en-IN,en;q=0.9" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`bootstrap ${res.status}`);
+    const html = await res.text();
+    const v = html.match(/"visitorData":"([^"]+)"/)?.[1];
+    const live = html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/)?.[1];
+    if (live) WEB_REMIX.version = live;
+    if (!v) throw new Error("visitorData not found in bootstrap");
+    visitorData = v;
+    visitorFetchedAt = Date.now();
+    visitorFailedAt = 0;
+    return v;
+  } catch (e: any) {
+    visitorFailedAt = Date.now();
+    if (visitorData) return visitorData; // stale beats dead
+    throw new SessionUnavailable(e?.message ?? "bootstrap failed");
+  }
 }
 
 function clientContext(c: InnertubeClient) {
@@ -75,7 +120,7 @@ function clientContext(c: InnertubeClient) {
   };
 }
 
-function ytHeaders(c: InnertubeClient): Record<string, string> {
+async function ytHeaders(c: InnertubeClient): Promise<Record<string, string>> {
   const h: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Goog-Api-Format-Version": "1",
@@ -87,7 +132,7 @@ function ytHeaders(c: InnertubeClient): Record<string, string> {
     "Accept-Language": "en-IN,en;q=0.9",
   };
   if (visitorData) h["X-Goog-Visitor-Id"] = visitorData;
-  return { ...h, ...loginHeaders() };
+  return { ...h, ...(await loginHeaders()) };
 }
 
 export interface PlayerFormat {
@@ -137,7 +182,7 @@ export async function player(c: InnertubeClient, videoId: string, timeoutMs = 90
     };
     const res = await fetch(`${API_YTM}/player?key=${INNERTUBE_KEY}&prettyPrint=false`, {
       method: "POST",
-      headers: ytHeaders(c),
+      headers: await ytHeaders(c),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -176,5 +221,3 @@ export async function player(c: InnertubeClient, videoId: string, timeoutMs = 90
 export async function sessionReady() {
   await ensureSession();
 }
-
-export { clientContext, ytHeaders };

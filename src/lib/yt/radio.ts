@@ -9,6 +9,12 @@
  *
  * Everything goes through the same originals-only filter as search — our measured 27.5%
  * pollution rate in YTM's own Mix queue (lofi/mashup/lyrical-video uploads) dies here.
+ *
+ * AUTOPLAY GUARANTEE: the /next Mix endpoint is the single most-gated InnerTube surface
+ * (measured: datacenter IPs get 200-but-empty or 4xx far more often than /search). An
+ * empty Mix used to mean an empty "Next up" — the #1 user complaint. When the Mix yields
+ * nothing (or the call fails), radioFor now rebuilds the queue from originals-only
+ * searches seeded by the track's title/artist, so autoplay survives the gate.
  */
 import { API_YTM, INNERTUBE_KEY, WEB_REMIX } from "./clients";
 import { getVisitorData, sessionReady } from "./innertube";
@@ -77,6 +83,8 @@ export interface RadioResult {
   dropped: Record<string, number>;
   /** playlistId for continuations (future extension) */
   playlistId?: string;
+  /** which source filled the queue: the RDAMVM Mix or the search fallback */
+  via?: "mix" | "search";
 }
 
 const radioCache = new Map<string, { at: number; data: RadioResult }>();
@@ -86,11 +94,20 @@ const RADIO_TTL = 60 * 60 * 1000; // 1h — a Mix is personalized-ish but stable
  * Radio queue for a seed track — the "Autoplay" layer. Falls back to a related-seeds
  * search (same song artist) when the radio endpoint yields nothing usable.
  */
-export async function radioFor(videoId: string, opts: { force?: boolean } = {}): Promise<RadioResult> {
+export async function radioFor(
+  videoId: string,
+  opts: { force?: boolean; title?: string; artist?: string } = {}
+): Promise<RadioResult> {
   const cached = radioCache.get(videoId);
   if (!opts.force && cached && Date.now() - cached.at < RADIO_TTL) return cached.data;
 
-  await sessionReady();
+  // Best-effort bootstrap: a dead session degrades to the related-seeds fallback
+  // below, never throws out of radio.
+  try {
+    await sessionReady();
+  } catch {
+    /* the /next call below answers !ok without a visitor id */
+  }
   const playlistId = `RDAMVM${videoId}`;
   const dropped: Record<string, number> = {};
 
@@ -122,6 +139,7 @@ export async function radioFor(videoId: string, opts: { force?: boolean } = {}):
   });
 
   let tracks: SearchTrack[] = [];
+  let via: "mix" | "search" = "mix";
   if (res.ok) {
     const j = await res.json();
     // panelToTrack already classifies (tier/junk/duration); just drop tier-0 and the seed
@@ -134,7 +152,31 @@ export async function radioFor(videoId: string, opts: { force?: boolean } = {}):
     Object.assign(dropped, clean.dropped);
   }
 
-  const out: RadioResult = { seedVideoId: videoId, tracks, dropped, playlistId };
+  // Empty/failed Mix → rebuild from originals-only search (title+artist led, then
+  // artist-led). This is what keeps "Next up" alive when the gate eats the endpoint.
+  if (tracks.length === 0 && opts.title && opts.title !== "Unknown") {
+    try {
+      const { searchOriginals } = await import("./search");
+      const artistFirst = (opts.artist ?? "").split(",")[0].trim();
+      const queries = [`${opts.title} ${artistFirst}`.trim(), artistFirst.length > 2 ? `${artistFirst} songs` : ""].filter(Boolean);
+      const seen = new Set<string>([videoId]);
+      for (const q of queries) {
+        if (tracks.length >= 25) break;
+        const r = await searchOriginals(q).catch(() => ({ tracks: [] as SearchTrack[] }));
+        for (const t of r.tracks) {
+          if (tracks.length >= 25) break;
+          if (seen.has(t.videoId) || t.durationSec < 45) continue;
+          seen.add(t.videoId);
+          tracks.push(t);
+        }
+      }
+      if (tracks.length > 0) via = "search";
+    } catch {
+      /* search fallback is best-effort — an empty result still returns cleanly */
+    }
+  }
+
+  const out: RadioResult = { seedVideoId: videoId, tracks, dropped, playlistId, via };
   if (tracks.length > 0) radioCache.set(videoId, { at: Date.now(), data: out });
   return out;
 }

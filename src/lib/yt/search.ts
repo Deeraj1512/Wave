@@ -157,7 +157,13 @@ export async function searchForSiblings(query: string): Promise<SearchResponse> 
 }
 
 async function runSearch(query: string, attemptsSpec: readonly (readonly [string, string | undefined])[]): Promise<SearchResponse> {
-  await sessionReady();
+  // Best-effort bootstrap: a dead session (bot wall / offline) must degrade to
+  // empty attempts, never throw out of search.
+  try {
+    await sessionReady();
+  } catch {
+    /* attempts below answer !ok without a visitor id — empty result, no crash */
+  }
   const attempts: string[] = [];
   const dropped: Record<string, number> = {};
   const bump = (k: string) => (dropped[k] = (dropped[k] ?? 0) + 1);

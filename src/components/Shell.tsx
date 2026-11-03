@@ -11,6 +11,7 @@ import type { Screen } from "@/lib/types";
 
 const NAV_ITEMS = [
   { key: "home" as const, label: "Home", icon: Home },
+  { key: "search" as const, label: "Search", icon: Search },
   { key: "explore" as const, label: "Explore", icon: Compass },
   { key: "library" as const, label: "Library", icon: Library },
 ];
