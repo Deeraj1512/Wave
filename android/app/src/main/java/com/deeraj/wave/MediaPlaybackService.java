@@ -305,7 +305,8 @@ public class MediaPlaybackService extends Service {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 if (focusRequest == null) {
-                    focusRequest = new AudioFocusRequest.Builder(AudioFocusRequest.AUDIOFOCUS_GAIN)
+                    // focusGain constants live on AudioManager, NOT on AudioFocusRequest
+                    focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                             .setAudioAttributes(new AudioAttributes.Builder()
                                     .setUsage(AudioAttributes.USAGE_MEDIA)
                                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -330,7 +331,8 @@ public class MediaPlaybackService extends Service {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
                 audioManager.abandonAudioFocusRequest(focusRequest);
             } else {
-                audioManager.abandonAudioFocusListener(focusListener);
+                // the legacy partner of requestAudioFocus(...) is abandonAudioFocus(...)
+                audioManager.abandonAudioFocus(focusListener);
             }
         } catch (Exception ignored) {
         } finally {
