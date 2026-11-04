@@ -34,6 +34,7 @@ type WaveAudioPlugin = {
   stop?: () => unknown;
   update?: (meta: NativeMediaMeta) => unknown;
   requestNotificationPermission?: () => unknown;
+  getNativeState?: () => Promise<{ running?: boolean; playing?: boolean }>;
 };
 
 type CapShape = {
@@ -139,6 +140,27 @@ export function notifyNativeMedia(meta: NativeMediaMeta | null): void {
     p.update?.(meta);
   } catch {
     /* the background service is an enhancement — never break playback over it */
+  }
+}
+
+/**
+ * The one honest answer to "is music actually playing right now?", read from the
+ * native service (APK only). A page reload asks this to tell a pull-to-refresh
+ * apart (service alive → keep playing) from a fresh open after a kill (service
+ * dead → restore the queue PAUSED at the saved position). Returns null on web
+ * builds (no plugin) — callers fall back to their pre-native behavior.
+ */
+export async function getNativePlaybackState(): Promise<
+  { running: boolean; playing: boolean } | null
+> {
+  const p = plugin();
+  if (!p || typeof p.getNativeState !== "function") return null;
+  try {
+    const st = await p.getNativeState();
+    if (!st || typeof st !== "object") return null;
+    return { running: !!st.running, playing: !!st.playing };
+  } catch {
+    return null;
   }
 }
 
