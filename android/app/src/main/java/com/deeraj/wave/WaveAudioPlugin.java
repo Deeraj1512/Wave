@@ -18,6 +18,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
  *   WaveAudio.stop()   — playback is gone for good (queue emptied → card dismissed)
  *   WaveAudio.update() — card content / play-pause state changed (track, pause, play)
  *   WaveAudio.requestNotificationPermission() — Android 13+ POST_NOTIFICATIONS dialog
+ *   WaveAudio.getNativeState() — is the service alive & audible? Lets a reloaded
+ *       WebView tell pull-to-refresh (resume audible) from open-after-kill (paused).
  *
  * All methods are idempotent — extra calls are harmless. A service-start failure
  * (rare OEM kills) must never break playback.
@@ -109,6 +111,21 @@ public class WaveAudioPlugin extends Plugin {
             }
         }
         call.resolve();
+    }
+
+    /**
+     * The freshly reloaded WebView's source of truth: is the native side still
+     * actually playing? A pull-to-refresh reloads the page while the foreground
+     * service never died → running + playing → the player may resume audible.
+     * After a kill the service is gone → running=false → the player must come
+     * back PAUSED (song + position restored, user taps ▶), never auto-play.
+     */
+    @PluginMethod
+    public void getNativeState(PluginCall call) {
+        JSObject state = new JSObject();
+        state.put("running", MediaPlaybackService.running);
+        state.put("playing", MediaPlaybackService.playingNow);
+        call.resolve(state);
     }
 
     private static String orEmpty(String s) {
