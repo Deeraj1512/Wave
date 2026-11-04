@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
 import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio } from "./api";
-import { notifyPlayState, notifyNativeMedia, notifyNativeProgress } from "./nativeBackground";
+import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, getNativePlaybackState } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import * as ytEmbed from "./ytEmbed";
@@ -1551,11 +1551,41 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     setQueue(q);
     setQueueIndex(idx);
     setPlayingFrom(s.playingFrom ?? null);
-    if (s.playing) loadDirect(t, { startAt: resumeAt, pauseOnDenied: true, restored: true, directUrl: savedUrl });
-    else loadDirect(t, { startAt: pos, paused: true, restored: true, directUrl: savedUrl });
-    // loadDirect re-anchors progress to 0 — restore the position AFTER it
-    // (the element itself re-seeks on loadedmetadata; this fixes the DISPLAY)
-    setProgressExact(s.playing ? resumeAt : pos);
+    let cancelled = false;
+    // KILL vs REFRESH: the saved `playing` flag lies after a kill — it stays
+    // true forever. So ask the native service whether music is REALLY audible
+    // right now: a pull-to-refresh reloads the page while the foreground service
+    // never died → resume audible exactly as before. A fresh open after a kill
+    // finds the service dead → restore the queue PAUSED at the saved second;
+    // the song waits for the user's ▶ and never starts on its own. No plugin
+    // (plain browser) → keep the old best-effort autoplay attempt: its denial
+    // path already pauses when the browser refuses.
+    const mayAutoPlay: Promise<boolean> = s.playing
+      ? getNativePlaybackState().then(
+          (st) => (st ? st.running && st.playing : true)
+        )
+      : Promise.resolve(false);
+    mayAutoPlay
+      .then((auto) => {
+        if (cancelled) return;
+        if (auto) {
+          loadDirect(t, { startAt: resumeAt, pauseOnDenied: true, restored: true, directUrl: savedUrl });
+        } else {
+          loadDirect(t, { startAt: pos, paused: true, restored: true, directUrl: savedUrl });
+        }
+        // loadDirect re-anchors progress to 0 — restore the position AFTER it
+        // (the element itself re-seeks on loadedmetadata; this fixes the DISPLAY)
+        setProgressExact(auto ? resumeAt : pos);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // the state probe must never block the restore — worst case: paused
+        loadDirect(t, { startAt: pos, paused: true, restored: true, directUrl: savedUrl });
+        setProgressExact(pos);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const readDuration = useCallback(() => {
