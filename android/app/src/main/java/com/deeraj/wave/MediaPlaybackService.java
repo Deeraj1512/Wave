@@ -12,8 +12,6 @@ import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Handler;
@@ -101,30 +99,16 @@ public class MediaPlaybackService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService artExecutor = Executors.newSingleThreadExecutor();
 
-    private AudioManager audioManager;
-    private AudioFocusRequest focusRequest;
-    private boolean focusHeld = false;
     private boolean noisyRegistered = false;
 
-    /** Focus loss = somebody else NEEDS the audio (a phone call, YouTube, another
-     *  player). Spotify behavior: step aside and stay paused — the user taps ▶
-     *  when they want us back. Always delivered on the main thread (the request
-     *  happens there; the O+ request binds this handler explicitly). */
-    private final AudioManager.OnAudioFocusChangeListener focusListener =
-            new AudioManager.OnAudioFocusChangeListener() {
-                @Override
-                public void onAudioFocusChange(int change) {
-                    switch (change) {
-                        case AudioManager.AUDIOFOCUS_LOSS:
-                        case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                        case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                            dispatch("pause");
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            };
+    // NOTE — we deliberately DO NOT request audio focus in this service. The
+    // song plays inside the WebView, and Chromium (the WebView engine) already
+    // holds audio focus for the audio element and pauses it when that focus is
+    // lost — that is exactly how "pause when a call / YouTube takes over"
+    // works, with the element's pause event flowing back into the card via
+    // notifyPlayState. Requesting focus from HERE steals it from our own audio
+    // element: Android notifies the WebView of the loss and the song dies less
+    // than a second after play starts. (Seen in the field. Do not re-add.)
 
     /** "Audio becoming noisy" = the output that was carrying the music just
      *  vanished — buds out of range / into their case, wired headphones
@@ -177,7 +161,6 @@ public class MediaPlaybackService extends Service {
             ch.setShowBadge(false);
             nm.createNotificationChannel(ch);
         }
-        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         try {
             IntentFilter noisy = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
             if (Build.VERSION.SDK_INT >= 33) {
@@ -264,13 +247,6 @@ public class MediaPlaybackService extends Service {
         }
 
         playingNow = playing;
-        // Own the audio while audible (a call / YouTube / another player then
-        // pauses us); hand it back the moment we go quiet so others can use it.
-        if (playing && !focusHeld) {
-            focusHeld = requestFocus();
-        } else if (!playing && focusHeld) {
-            abandonFocus();
-        }
 
         Notification n = buildNotification();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -297,47 +273,6 @@ public class MediaPlaybackService extends Service {
             wakeLock.release();
         }
         return START_NOT_STICKY;
-    }
-
-    /** Take over media audio focus (the polite Spotify-style handshake). */
-    private boolean requestFocus() {
-        if (audioManager == null) return false;
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (focusRequest == null) {
-                    // focusGain constants live on AudioManager, NOT on AudioFocusRequest
-                    focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                            .setAudioAttributes(new AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                    .build())
-                            .setOnAudioFocusChangeListener(focusListener, main)
-                            .build();
-                }
-                return audioManager.requestAudioFocus(focusRequest)
-                        == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-            }
-            return audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        } catch (Exception e) {
-            return false; // focus trouble must never block playback
-        }
-    }
-
-    /** Give the audio back (pause, destroy) so calls and other apps can use it. */
-    private void abandonFocus() {
-        try {
-            if (audioManager == null) return;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
-                audioManager.abandonAudioFocusRequest(focusRequest);
-            } else {
-                // the legacy partner of requestAudioFocus(...) is abandonAudioFocus(...)
-                audioManager.abandonAudioFocus(focusListener);
-            }
-        } catch (Exception ignored) {
-        } finally {
-            focusHeld = false;
-        }
     }
 
     /** Push title/artist/album/art + play state into the MediaSession and refresh the card. */
@@ -482,7 +417,6 @@ public class MediaPlaybackService extends Service {
             }
             noisyRegistered = false;
         }
-        abandonFocus();
         artExecutor.shutdownNow();
         if (session != null) {
             try {
