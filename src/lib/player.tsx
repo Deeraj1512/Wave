@@ -6,6 +6,7 @@ import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invali
 import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, getNativePlaybackState } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
+import { rememberHeard, filterFresh, isStaleSession } from "./queueVariety";
 import * as ytEmbed from "./ytEmbed";
 import {
   initMediaSession,
@@ -223,6 +224,55 @@ export function balancedShuffle<T extends { artist: string }>(tracks: T[]): T[] 
   // every track belongs to exactly one group and every group found a free slot,
   // so `out` is fully populated at this point.
   return out as T[];
+}
+
+/**
+ * Artist cap per radio block — the anti-"queue full of one artist" rule (the
+ * user-facing bug: play one Sushin Shyam song, get ONLY Sushin Shyam back).
+ * A regular artist contributes at most 2 songs per block; the seed song's own
+ * artist/composer keeps 3 so the "similar vibe" promise stays visible up top.
+ * Combined with balancedShuffle (below), the queue reads like a playlist, not
+ * a discography.
+ */
+function capArtists(pool: Track[], seedArtist: string): Track[] {
+  const ARTIST_CAP = 2;
+  const SEED_CAP = 3;
+  const seedKeys = new Set(seedArtist.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean));
+  const counts = new Map<string, number>();
+  const out: Track[] = [];
+  for (const t of pool) {
+    const parts = t.artist.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+    const key = parts[0] || t.artist.toLowerCase();
+    const isSeed = parts.some((a) => seedKeys.has(a));
+    const cap = isSeed ? SEED_CAP : ARTIST_CAP;
+    const n = counts.get(key) ?? 0;
+    if (n >= cap) continue;
+    counts.set(key, n + 1);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Taste boost — the queue must match the LISTENER, not only the song: up to 3
+ * tracks by the user's own top artists (history.topArtists) are pulled to the
+ * front of the block. One new artist heard once sprinkles 1-2 songs; repeated
+ * listening promotes them — feed-follows-behavior, nothing forced.
+ */
+function familiarBoost(pool: Track[]): Track[] {
+  try {
+    const fam = new Set(topArtists(10).map(primaryArtist));
+    if (fam.size === 0) return pool;
+    const head: Track[] = [];
+    const tail: Track[] = [];
+    for (const t of pool) {
+      if (fam.has(primaryArtist(t.artist)) && head.length < 3) head.push(t);
+      else tail.push(t);
+    }
+    return [...head, ...tail];
+  } catch {
+    return pool;
+  }
 }
 
 interface PlayerState {
@@ -1005,6 +1055,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         loadedIdRef.current = t.id;
         // log to listening history (drives the personalized home feed) — real id when resolved
         recordPlay({ id: t.id, title: t.title, artist: t.artist, cover: t.cover });
+        // variety memory: this song was heard now — radio blocks built tomorrow skip it
+        rememberHeard([t.id]);
         loadDirect(t);
       })();
     },
@@ -1052,15 +1104,20 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           ranked = shaped.length > 0 ? shaped : pool; // a flavor that yields nothing must never kill playback
         }
         const haveBases = new Set(q.map((x) => baseTitle(x.title))); // blocks the same song in another language
-        const build = (src: Track[]) =>
-          relateBlock(seedTrack, src)
-            .filter((t) => {
-              if (t.id === seedTrack.id || q.some((x) => x.id === t.id)) return false;
-              const tb = baseTitle(t.title);
-              return !haveBases.has(tb);
-            })
+        const build = (src: Track[]) => {
+          // VARIETY PIPELINE (see queueVariety.ts): language-locked relateBlock →
+          // artist cap (max 2 per artist, seed artist 3) → artist-spaced random
+          // shuffle → drop songs heard on previous days → taste boost → block.
+          // Same seed, new day = a completely different queue; same day = same flow.
+          const candidates = relateBlock(seedTrack, src).filter((t) => {
+            if (t.id === seedTrack.id || q.some((x) => x.id === t.id)) return false;
+            const tb = baseTitle(t.title);
+            return !haveBases.has(tb);
+          });
+          return familiarBoost(filterFresh(balancedShuffle(capArtists(candidates, seedTrack.artist))))
             .slice(0, 15)
             .map((t) => ({ ...t, uid: `r:${t.id}:${uidSeqRef.current++}`, layer: "radio" as const }));
+        };
         let add = build(ranked);
         if (add.length === 0) {
           // AUTOPLAY GUARANTEE (client net): the Mix endpoint is the most-gated InnerTube
@@ -1290,6 +1347,27 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const id = setTimeout(() => loadAndPlay(current), 0);
     return () => clearTimeout(id);
   }, [queueIndex, current?.id, loadAndPlay]);
+
+  // ── heard memory: every song played or skipped past counts as "heard" ──────
+  // The variety engine (queueVariety.ts) uses this so a radio block rebuilt
+  // tomorrow is built from DIFFERENT songs than today's. Re-anchored (no
+  // comparison) whenever the whole queue is replaced — pass-over counting only
+  // applies within one queue (advance / jump), never across contexts.
+  const heardIdxRef = useRef(0);
+  const heardQRef = useRef<QTrack[] | null>(null);
+  useEffect(() => {
+    if (queue !== heardQRef.current) {
+      heardQRef.current = queue;
+      heardIdxRef.current = queueIndex;
+      return;
+    }
+    const from = heardIdxRef.current;
+    heardIdxRef.current = queueIndex;
+    if (queueIndex > from) {
+      const passed = queue.slice(from, queueIndex).map((x) => x.id).filter(Boolean);
+      if (passed.length > 0) rememberHeard(passed);
+    }
+  }, [queueIndex, queue]);
 
   // audio element event wiring (progress / ended / buffering — direct engine only)
   useEffect(() => {
@@ -1532,6 +1610,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const idx = Math.min(Math.max(0, Math.floor(s.index ?? 0)), q.length - 1);
     const t = q[idx];
     if (!t?.id) return;
+    // OPTION A freshness rule: the app was closed for more than ~8h (yesterday's
+    // session) → the upcoming radio block is dropped and the prefill rebuilds it
+    // fresh through the variety engine. Same-day reopen → the queue returns as-is.
+    const stale = isStaleSession(s.at) && autoplayRef.current;
     const pos = Math.max(0, Number(s.position) || 0);
     // THE FLOW RULE (user request): a refresh must never stop, rewind or restart
     // the song — the counter keeps advancing as if the audio never died. The
@@ -1548,7 +1630,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     // the queue-index effect must not re-fire loadAndPlay over the restore
     pendingRef.current = true;
     loadedIdRef.current = t.id;
-    setQueue(q);
+    // stale sessions keep the current song + manual picks, drop the old radio layer
+    setQueue(stale ? q.filter((x, i) => i <= idx || x.layer !== "radio") : q);
     setQueueIndex(idx);
     setPlayingFrom(s.playingFrom ?? null);
     let cancelled = false;
@@ -1819,8 +1902,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           try {
             const tracks = await radioApi(t.id, { title: t.title, artist: t.artist });
             const exclude = new Set(queueRef.current.map((x) => x.id));
-            const add = tracks
-              .filter((x) => !exclude.has(x.id) && x.id !== t.id)
+            // same variety pipeline as the autoplay blocks (cap → space → fresh → taste)
+            const add = familiarBoost(
+                filterFresh(balancedShuffle(capArtists(tracks.filter((x) => !exclude.has(x.id) && x.id !== t.id), t.artist)))
+              )
               .slice(0, 30)
               .map((x) => ({ ...x, uid: `r:${x.id}:${uidSeqRef.current++}`, layer: "radio" as const }));
             if (add.length === 0) return false;

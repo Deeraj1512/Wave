@@ -5,6 +5,7 @@
 import { API_YTM, INNERTUBE_KEY, WEB_REMIX } from "./clients";
 import { getVisitorData, sessionReady } from "./innertube";
 import { classify, normalizeTitle, parseViews, relevanceRank, relevanceScore, sanitize, type ItemKind, type SearchTrack } from "./filters";
+import { parseAlbumRows, type SearchAlbum } from "./album";
 
 // Songs filter param (well-known YTM search filter constant)
 const PARAM_SONGS = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
@@ -131,16 +132,26 @@ function parseItem(item: any): ParsedItem | null {
 export interface SearchResponse {
   query: string;
   tracks: SearchTrack[];
+  /** album entities from the response's ALBUMS shelf (browseId MPREb_) — empty
+   *  when the search short-circuited on a confident song attempt */
+  albums: SearchAlbum[];
   dropped: Record<string, number>;
   attempts: string[];
 }
 
 export async function searchOriginals(query: string): Promise<SearchResponse> {
-  return runSearch(query, [
-    ["songs", PARAM_SONGS],
-    ["videos", PARAM_VIDEOS],
-    ["top", undefined],
-  ]);
+  // dropUgc: search is a LISTENING surface — tier 3 (UGC under 100k views) is
+  // exactly the "random unknown songs" the user reported. Radio/stream fallbacks
+  // keep tier 3 via searchForSiblings below.
+  return runSearch(
+    query,
+    [
+      ["songs", PARAM_SONGS],
+      ["videos", PARAM_VIDEOS],
+      ["top", undefined],
+    ],
+    { dropUgc: true }
+  );
 }
 
 /**
@@ -156,7 +167,12 @@ export async function searchForSiblings(query: string): Promise<SearchResponse> 
   ]);
 }
 
-async function runSearch(query: string, attemptsSpec: readonly (readonly [string, string | undefined])[]): Promise<SearchResponse> {
+async function runSearch(
+  query: string,
+  attemptsSpec: readonly (readonly [string, string | undefined])[],
+  opts?: { dropUgc?: boolean }
+): Promise<SearchResponse> {
+  const albums: SearchAlbum[] = [];
   // Best-effort bootstrap: a dead session (bot wall / offline) must degrade to
   // empty attempts, never throw out of search.
   try {
@@ -214,6 +230,13 @@ async function runSearch(query: string, attemptsSpec: readonly (readonly [string
 
     const raw = await res.json();
     const items = collectItems(raw);
+    // album entities ride along in the same response (the unfiltered attempt's
+    // ALBUMS shelf) — free access, no second request
+    if (albums.length < 12) {
+      for (const a of parseAlbumRows(items)) {
+        if (!albums.some((x) => x.browseId === a.browseId)) albums.push(a);
+      }
+    }
     const parsed = items.map(parseItem).filter((x): x is ParsedItem => x !== null);
     const classified = parsed.map(classify);
     const { clean } = sanitize(classified);
@@ -233,7 +256,8 @@ async function runSearch(query: string, attemptsSpec: readonly (readonly [string
     }
 
     if (merged.size === 0) continue;
-    const ranked = relevanceRank([...merged.values()], query);
+    const pool = opts?.dropUgc ? [...merged.values()].filter((t) => t.tier > 0 && t.tier < 3) : [...merged.values()];
+    const ranked = relevanceRank(pool, query);
     const top = ranked[0];
     const topScore = top ? relevanceScore(top, query) : 0;
     // Artist-led queries legitimately have low TITLE scores ("Sid Sriram" → his songs).
@@ -252,11 +276,14 @@ async function runSearch(query: string, attemptsSpec: readonly (readonly [string
     // isn't in the videos attempt — merging lets the views tiebreak pick the right one.
     const confident = topScore >= WEAK_TOP && (top?.views ?? 0) >= 50_000;
     if (confident || artistStrong || i === attemptsSpec.length - 1) {
-      return { query, tracks: ranked, dropped, attempts };
+      // rel: the query-match score rides along so the client can apply TASTE
+      // re-ranking without ever letting taste override a relevance tier
+      const withRel = ranked.map((t) => ({ ...t, rel: relevanceScore(t, query) }));
+      return { query, tracks: withRel, albums, dropped, attempts };
     }
     // weak top result → fall through and merge the next attempt's results
   }
-  return { query, tracks: [], dropped, attempts };
+  return { query, tracks: [], albums, dropped, attempts };
 }
 
 function classifiedDrops(classified: SearchTrack[]): Record<string, number> {

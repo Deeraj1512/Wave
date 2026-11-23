@@ -27,4 +27,5 @@ export type Screen =
   | { name: "explore" }
   | { name: "search" }
   | { name: "library" }
-  | { name: "playlist"; id: string };
+  | { name: "playlist"; id: string }
+  | { name: "album"; id: string }; // "Go to album" — the album page, openable from anywhere

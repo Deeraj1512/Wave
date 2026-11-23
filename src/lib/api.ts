@@ -14,6 +14,7 @@
 import type { Track } from "./types";
 import { colorFor } from "./data";
 import { detectTrackLang } from "./langs";
+import { recentPlays, topArtists } from "./history";
 
 /** True inside the Capacitor Android/iOS shell (APK), false in any browser. */
 export const IS_NATIVE: boolean =
@@ -29,11 +30,23 @@ export interface ApiTrack {
   views: number;
   tier: number;
   thumb?: string;
+  /** query-match score from the server rank — lets taste refine without overriding it */
+  rel?: number;
+}
+
+/** Album entity (an MPREb_ browse target) surfaced by search / album-name search. */
+export interface ApiAlbum {
+  browseId: string;
+  title: string;
+  artist: string;
+  year?: string;
+  thumb?: string;
 }
 
 interface SearchResponse {
   query: string;
   tracks: ApiTrack[];
+  albums?: ApiAlbum[];
   dropped: Record<string, number>;
   attempts: string[];
   cached?: boolean;
@@ -100,28 +113,197 @@ function detectLang(t: ApiTrack): Track["lang"] {
   return detectTrackLang(t);
 }
 
+// ── taste re-ranking (the "results follow MY taste" rule) ───────────────────
+
+function foldName(s: string): string {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+/** Dominant language of recent listening (needs ≥2 plays to count) — else undefined. */
+function tasteLangOf(): string | undefined {
+  try {
+    const counts = new Map<string, number>();
+    for (const p of recentPlays(40)) {
+      const l = detectTrackLang(p);
+      if (l) counts.set(l, (counts.get(l) ?? 0) + 1);
+    }
+    let best: string | undefined;
+    let n = 1;
+    for (const [l, c] of counts) if (c > n) { n = c; best = l; }
+    return best;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-rank search results by the listener's taste WITHOUT ever overriding the
+ * query-match order: results are grouped into relevance buckets from the
+ * server's rel score (exact ≫ prefix ≫ phrase ≫ tokens), and taste only
+ * re-orders INSIDE a bucket — your top artists and your listening language
+ * float up, a different language sinks a little. A perfect but unknown match
+ * still beats a half-match by your favourite artist.
+ */
+export function tasteRank(tracks: Track[], rels: number[]): Track[] {
+  try {
+    const fam = new Set(topArtists(10).map((a) => foldName(a)).filter(Boolean));
+    const tLang = tasteLangOf();
+    if (fam.size === 0 && !tLang) return tracks;
+    const bucket = (rel: number) => (rel >= 9000 ? 4 : rel >= 4500 ? 3 : rel >= 1800 ? 2 : rel > 0 ? 1 : 0);
+    const scored = tracks.map((t, i) => {
+      const primary = (t.artist || "").split(",")[0].trim().toLowerCase();
+      let taste = 0;
+      if (primary && fam.has(primary)) taste += 3;
+      else if (primary && [...fam].some((f) => f.includes(primary) || primary.includes(f))) taste += 1;
+      if (t.lang && tLang && t.lang === tLang) taste += 1.5;
+      else if (t.lang && tLang && t.lang !== tLang) taste -= 0.5;
+      return { t, key: bucket(rels[i] ?? 0) * 10 + taste, i };
+    });
+    scored.sort((a, b) => b.key - a.key || a.i - b.i);
+    return scored.map((x) => x.t);
+  } catch {
+    return tracks;
+  }
+}
+
 export async function searchApi(q: string, signal?: AbortSignal): Promise<Track[]> {
   if (IS_NATIVE) {
     // APK: no backend — run the identical originals-only YTM search in-process.
     const { searchOriginals } = await import("./yt/search");
     const data = await searchOriginals(q);
-    return data.tracks.map((t) =>
-      apiTrackToTrack({
-        videoId: t.videoId,
-        title: t.title,
-        artist: t.artist,
-        album: t.album,
-        durationSec: t.durationSec,
-        views: t.views,
-        tier: t.tier,
-        thumb: t.thumb,
-      })
+    return tasteRank(
+      data.tracks.map(mapApiTrack),
+      data.tracks.map((t) => t.rel ?? 0)
     );
   }
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal });
   if (!res.ok) throw new Error(`search ${res.status}`);
   const data = (await res.json()) as SearchResponse;
-  return data.tracks.map(apiTrackToTrack);
+  return tasteRank(
+    data.tracks.map(mapApiTrack),
+    data.tracks.map((t) => t.rel ?? 0)
+  );
+}
+
+const mapApiTrack = (t: ApiTrack): Track => apiTrackToTrack(t);
+
+// ── Albums (Innertube access: entity search + exact album page) ─────────────
+
+/** Song + album entities for the search screen (albums ride along when the
+ *  server's response carried them; the Albums tab fetches a dedicated
+ *  entity search itself when this list is empty). */
+export async function searchFullApi(
+  q: string,
+  signal?: AbortSignal
+): Promise<{ tracks: Track[]; albums: ApiAlbum[] }> {
+  if (IS_NATIVE) {
+    const { searchOriginals } = await import("./yt/search");
+    const data = await searchOriginals(q);
+    return {
+      tracks: tasteRank(
+        data.tracks.map(mapApiTrack),
+        data.tracks.map((t) => t.rel ?? 0)
+      ),
+      albums: data.albums ?? [],
+    };
+  }
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal });
+  if (!res.ok) throw new Error(`search ${res.status}`);
+  const data = (await res.json()) as SearchResponse;
+  return {
+    tracks: tasteRank(
+      data.tracks.map(mapApiTrack),
+      data.tracks.map((t) => t.rel ?? 0)
+    ),
+    albums: data.albums ?? [],
+  };
+}
+
+/** Album entities for a name ("type the album, find the album"). */
+export async function albumSearchApi(q: string, artist?: string): Promise<ApiAlbum[]> {
+  const pack = (a: {
+    browseId: string;
+    title: string;
+    artist: string;
+    year?: string;
+    thumb?: string;
+  }): ApiAlbum => ({ browseId: a.browseId, title: a.title, artist: a.artist, year: a.year, thumb: a.thumb });
+  if (IS_NATIVE) {
+    const { searchAlbums } = await import("./yt/album");
+    const list = await searchAlbums(q);
+    return list.map(pack);
+  }
+  const p = new URLSearchParams({ q });
+  if (artist) p.set("artist", artist);
+  const res = await fetch(`/api/album?${p.toString()}`);
+  if (!res.ok) return [];
+  const data = (await res.json()) as { album?: ApiAlbum; albums?: ApiAlbum[] };
+  if (data.album) return [pack(data.album)];
+  return (data.albums ?? []).map(pack);
+}
+
+export interface AlbumBrowseResult {
+  album: ApiAlbum;
+  tracks: Track[];
+}
+
+function packAlbumDetail(d: {
+  browseId: string;
+  title: string;
+  artist: string;
+  year?: string;
+  thumb?: string;
+  tracks: Array<{ videoId: string; title: string; artist: string; album: string; durationSec: number }>;
+}): AlbumBrowseResult {
+  return {
+    album: { browseId: d.browseId, title: d.title, artist: d.artist, year: d.year, thumb: d.thumb },
+    tracks: d.tracks.map((t) =>
+      apiTrackToTrack({
+        videoId: t.videoId,
+        title: t.title,
+        artist: t.artist,
+        album: d.title,
+        durationSec: t.durationSec,
+        views: 0,
+        tier: 1,
+        thumb: d.thumb,
+      })
+    ),
+  };
+}
+
+/** The EXACT album page for an MPREb_ browse id — real tracklist, real credits. */
+export async function albumBrowseApi(browseId: string): Promise<AlbumBrowseResult | null> {
+  if (IS_NATIVE) {
+    const { browseAlbum } = await import("./yt/album");
+    const d = await browseAlbum(browseId);
+    return d ? packAlbumDetail(d) : null;
+  }
+  const res = await fetch(`/api/album?browseId=${encodeURIComponent(browseId)}`);
+  if (!res.ok) return null;
+  const data = (await res.json()) as { album?: Parameters<typeof packAlbumDetail>[0] };
+  return data.album ? packAlbumDetail(data.album) : null;
+}
+
+// ── Search suggestions (YouTube typing behavior) ────────────────────────────
+
+export async function suggestApi(q: string): Promise<string[]> {
+  if (IS_NATIVE) {
+    const { searchSuggestions } = await import("./yt/suggest");
+    return searchSuggestions(q);
+  }
+  try {
+    const res = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { suggestions?: string[] };
+    return Array.isArray(data.suggestions) ? data.suggestions : [];
+  } catch {
+    return [];
+  }
 }
 
 // ── Radio (autoplay layer) ────────────────────────────────────────────────────

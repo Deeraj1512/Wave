@@ -71,6 +71,8 @@ export interface SearchTrack {
   thumb?: string;
   /** tier 1 = ATV official song, 2 = OFFICIAL_SOURCE, 3 = clean UGC, 0 = rejected */
   tier: number;
+  /** query-match score (relevanceScore) — rides along for client taste re-ranking */
+  rel?: number;
   dropReason?: string;
 }
 
