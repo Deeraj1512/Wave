@@ -2,12 +2,15 @@
  * "Go to album" — resolves the album behind ANY song and opens its tracklist.
  *
  * Resolution ladder (never throws, toast on false):
+ *  0. EXACT LINKAGE — YouTube's own song→album metadata: the watch-next seed
+ *     row for the track's videoId carries the album as an MPREb_ run; /browse
+ *     on it returns the real album page. This is THE path — name-searching
+ *     was removed as a primary lane after it opened junk albums that merely
+ *     SHARE the song's name ("Chitti" → a 229-play album named "Chitti").
  *  1. fast path — the album registry already holds this album this session;
- *  2. EXACT path — the Innertube album chain (yt/album.ts): search the album
- *     name as an ENTITY (MPREb_ browse id), then /browse returns the real
- *     album page with its complete official tracklist. This replaced the old
- *     fuzzy "group whatever a song search returned" flow — the page now shows
- *     the album AS IT IS on YTM (the user's ask);
+ *  2. entity path — album NAME search (now seeded with the linkage's real
+ *     album name, artist bias can no longer override the title match), then
+ *     /browse returns the real album page with its complete official tracklist;
  *  3. legacy fallback — song-name search grouped by parsed album bylines,
  *     kept for catalog/library tracks the entity search can't find.
  *
@@ -17,7 +20,7 @@
  * through the same exact chain.
  */
 
-import { searchApi, albumSearchApi, albumBrowseApi } from "./api";
+import { searchApi, albumSearchApi, albumBrowseApi, albumForVideoApi } from "./api";
 import { getAlbumTracks, isRealAlbumName, registerAlbum } from "./albums";
 import type { Track } from "./types";
 
@@ -57,18 +60,42 @@ function entityMatches(entityTitle: string, name: string): boolean {
 /**
  * Resolve + open the album for `track`. Resolves false when nothing matched —
  * callers show a toast; it never throws.
+ *
+ * Step 0 is YouTube's OWN song→album linkage (watch-next seed row → MPREb_
+ * album run → exact album page). It made name-guessing obsolete: resolving
+ * "Chitti" (Jathi Ratnalu) by title search used to open a junk 229-play
+ * album of the same name — the linkage lands the movie's real album every
+ * time, because it never searches by name at all.
  */
 export async function openAlbumFor(track: Track): Promise<boolean> {
   const name = (track.album || "").trim();
   const artistFirst = track.artist.split(",")[0].trim();
 
-  // candidate album names, best first: the parsed album (when real), then the
-  // song title itself (YTM singles: release page titled like the song)
+  // ── step 0: the EXACT linkage, straight from YouTube for this videoId ──────
+  const linked = await albumForVideoApi(track.id).catch(() => null);
+  if (linked?.page) {
+    const pageKey = fold(linked.page.album.title);
+    if (pageKey && linked.page.tracks.length > 0) {
+      registerAlbum(pageKey, linked.page.tracks);
+      // the parsed album slot may spell it differently ("Jathiratnalu" vs
+      // "Jathi Ratnalu") — that key resolves to the same page too
+      const parsed = fold(name);
+      if (parsed && parsed !== pageKey && isRealAlbumName(name, track)) registerAlbum(parsed, linked.page.tracks);
+      announce(pageKey);
+      return true;
+    }
+  }
+
+  // ── candidate album names, best first ──────────────────────────────────────
+  // YouTube's own album name for this video (when the linkage gave a name but
+  // no page) beats every guess; then the parsed album, then — last resort —
+  // the song title (YTM single releases are titled like the song).
   const candidates: string[] = [];
   const push = (s?: string) => {
     const v = (s || "").trim();
     if (v && !candidates.some((c) => fold(c) === fold(v))) candidates.push(v);
   };
+  if (linked?.albumName && isRealAlbumName(linked.albumName, track)) push(linked.albumName);
   if (isRealAlbumName(name, track)) push(name);
   push(track.title);
 
@@ -80,7 +107,9 @@ export async function openAlbumFor(track: Track): Promise<boolean> {
       return true;
     }
 
-    // 2. exact path — album entity search + /browse page
+    // 2. exact path — album entity search + /browse page. A candidate is only
+    //    accepted when its TITLE matches the candidate (the old artist-bias
+    //    first-pick opened a different album by the same singer).
     const entities = await albumSearchApi(cand, artistFirst || undefined).catch(() => []);
     for (const e of entities.slice(0, 3)) {
       if (!entityMatches(e.title, cand)) continue;
