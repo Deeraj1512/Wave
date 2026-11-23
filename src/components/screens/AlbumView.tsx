@@ -8,10 +8,13 @@ import { useCover } from "@/lib/covers";
 import { getAlbumTracks } from "@/lib/albums";
 
 /**
- * Album page (YTM-style) — opened from the Albums section of search results.
- * The user types an album name, lands here, and plays any song from the
- * tracklist without ever knowing the song's name. The tracklist is the exact
- * result group the album was detected from; rows play within the album queue.
+ * Album page (YTM-style). Two homes:
+ *   in-page — opened from the Albums section of search results (its back arrow
+ *   returns to the results);
+ *   over-player page — "Go to album" from the full player opens this same
+ *   view as a separate page ABOVE the player; the back arrow closes it and the
+ *   player is right there again (page.tsx overlay).
+ * Rows play within the album queue.
  */
 export function AlbumView({ id, onBack }: { id: string; onBack: () => void }) {
   const { playTrack, toggleShuffle, shuffle } = usePlayer();
@@ -27,8 +30,8 @@ export function AlbumView({ id, onBack }: { id: string; onBack: () => void }) {
         <Disc3 className="mx-auto h-10 w-10 text-muted-foreground/50" />
         <p className="mt-4 text-lg font-bold">Album not found</p>
         <p className="mt-1 text-sm text-muted-foreground">Search for it again to refresh its songs.</p>
-        <button onClick={onBack} className="mt-5 rounded-full bg-surface-2 px-5 py-2.5 text-sm font-medium transition hover:bg-surface-3" aria-label="Back to search results">
-          Back to results
+        <button onClick={onBack} className="mt-5 rounded-full bg-surface-2 px-5 py-2.5 text-sm font-medium transition hover:bg-surface-3" aria-label="Go back">
+          Go back
         </button>
       </div>
     );
@@ -38,7 +41,7 @@ export function AlbumView({ id, onBack }: { id: string; onBack: () => void }) {
     <div className="space-y-6 pb-8">
       {/* Hero */}
       <div className="relative -mx-4 -mt-4 overflow-hidden px-4 pb-6 pt-4 sm:-mx-6 sm:px-6" style={{ background: "linear-gradient(180deg, rgba(255,255,255,0.07) 0%, transparent 100%)" }}>
-        <button onClick={onBack} className="mb-5 flex h-10 w-10 items-center justify-center rounded-full bg-surface-2 transition hover:bg-surface-3" aria-label="Back to search results">
+        <button onClick={onBack} className="mb-5 flex h-10 w-10 items-center justify-center rounded-full bg-surface-2 transition hover:bg-surface-3" aria-label="Go back">
           <ArrowLeft className="h-5 w-5" />
         </button>
         <div className="flex flex-col items-center gap-6 text-center sm:flex-row sm:items-end sm:text-left">

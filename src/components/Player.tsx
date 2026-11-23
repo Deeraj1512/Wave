@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayer, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
+import { registerBackHandler } from "@/lib/backStack";
 import { useCover } from "@/lib/covers";
 import { fmtTime } from "@/lib/data";
 import { recentPlays, subscribeHistory, type RecentPlay } from "@/lib/history";
@@ -462,12 +463,14 @@ export function FullPlayer() {
   }, [current?.id, carouselX]);
 
   // Android back button (APK): Wave's layers close first — ⋮ sheet → queue →
-  // full player — and only when everything is already closed does the native
-  // side minimize the app (music keeps playing, YTM's back behavior).
+  // full player — and only when everything here is already closed does the
+  // press fall through to the lower layers (screen history) or minimize the
+  // app (music keeps playing, YTM's back behavior). Handlers live on the
+  // shared back stack (lib/backStack.ts), so the album overlay that opens
+  // ABOVE this player always gets its press first.
   // MainActivity.onBackPressed calls window.__waveBack(); true = consumed.
   useEffect(() => {
-    const w = window as unknown as { __waveBack?: () => boolean };
-    w.__waveBack = () => {
+    return registerBackHandler("full-player", 20, () => {
       if (sheet) {
         setSheet(null);
         return true;
@@ -481,10 +484,7 @@ export function FullPlayer() {
         return true;
       }
       return false;
-    };
-    return () => {
-      delete w.__waveBack;
-    };
+    });
   }, [expanded, queueOpen, sheet, setExpanded]);
 
   return (

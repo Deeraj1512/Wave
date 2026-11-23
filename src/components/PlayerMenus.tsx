@@ -316,6 +316,9 @@ export function MoreOptionsSheet({
                 subtitle={current.album}
                 onClick={() => {
                   onClose();
+                  // the album page slides up OVER this player once resolved —
+                  // cue it, resolution is a live lookup (~1s)
+                  toast({ title: "Opening album…", duration: 2000 });
                   void openAlbumFor(current).then((ok) => {
                     if (!ok) toast({ title: "Album not found for this song", duration: 2500 });
                   });

@@ -1,21 +1,22 @@
 "use client";
 
 import { useState } from "react";
-import { ListPlus, ListStart, MoreVertical, Music, Play, Radio } from "lucide-react";
+import { Disc3, ListPlus, ListStart, MoreVertical, Music, Play, Radio } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Track } from "@/lib/types";
 import { usePlayer } from "@/lib/player";
 import { useCover } from "@/lib/covers";
 import { useToast } from "@/hooks/use-toast";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { canGoToAlbum, openAlbumFor } from "@/lib/goToAlbum";
 import { AddToPlaylistSheet } from "./PlayerMenus";
 import { Cover } from "./Cover";
 
 /**
- * The song three-dot menu — Play next · Add to queue · Add to playlist · Start
- * radio — shared by every card surface (Quick picks, home shelves, Explore) so
- * the queue + library actions follow the song wherever it appears (TrackRow
- * carries the same menu for lists).
+ * The song three-dot menu — Play next · Add to queue · Add to playlist · Go to
+ * album · Start radio — shared by every card surface (Quick picks, home
+ * shelves, Explore) so the queue + library + album actions follow the song
+ * wherever it appears (TrackRow carries the same menu for lists).
  */
 function SongCardMenu({ track }: { track: Track }) {
   const { playNext, addToQueue, startRadio } = usePlayer();
@@ -55,6 +56,18 @@ function SongCardMenu({ track }: { track: Track }) {
         <DropdownMenuItem onClick={() => setPlOpen(true)} className="gap-2.5">
           <Music className="h-4 w-4 text-muted-foreground" /> Add to playlist
         </DropdownMenuItem>
+        {canGoToAlbum(track) && (
+          <DropdownMenuItem
+            onClick={() => {
+              void openAlbumFor(track).then((ok) => {
+                if (!ok) toast({ title: "Album not found for this song", duration: 2500 });
+              });
+            }}
+            className="gap-2.5"
+          >
+            <Disc3 className="h-4 w-4 text-muted-foreground" /> Go to album
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem
           onClick={() => {
             startRadio(track);
