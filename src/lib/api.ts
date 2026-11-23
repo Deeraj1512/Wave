@@ -123,47 +123,76 @@ function foldName(s: string): string {
     .trim();
 }
 
-/** Dominant language of recent listening (needs ≥2 plays to count) — else undefined. */
-function tasteLangOf(): string | undefined {
+/**
+ * The listener's language profile — how many plays went to each language
+ * (recent history, play-count weighted). This is "the priority he listens
+ * which type of language": a user who lives in Telugu gets Telugu results
+ * ranked above the rest, at EQUAL query relevance.
+ */
+function tasteLangWeights(): Map<string, number> {
+  const counts = new Map<string, number>();
   try {
-    const counts = new Map<string, number>();
-    for (const p of recentPlays(40)) {
-      const l = detectTrackLang(p);
-      if (l) counts.set(l, (counts.get(l) ?? 0) + 1);
+    for (const p of recentPlays(60)) {
+      // lang was frozen at play time (exact for catalog + live-inferred tracks);
+      // detectTrackLang is the fallback for older entries without one
+      const l = p.lang ?? detectTrackLang({ title: p.title });
+      if (!l) continue;
+      counts.set(l, (counts.get(l) ?? 0) + Math.max(1, p.n ?? 1));
     }
-    let best: string | undefined;
-    let n = 1;
-    for (const [l, c] of counts) if (c > n) { n = c; best = l; }
-    return best;
   } catch {
-    return undefined;
+    /* fresh install — no taste profile yet */
   }
+  return counts;
+}
+
+/** "812M" / "4.2B" / "96K" → the numeric play count (0 when unparseable). */
+function playsNum(plays: string): number {
+  const m = /^([\d.]+)\s*([KMB]?)$/i.exec((plays || "").trim());
+  if (!m) return 0;
+  const mult = { k: 1e3, m: 1e6, b: 1e9 }[m[2]?.toLowerCase() ?? ""] ?? 1;
+  return Math.round(parseFloat(m[1]) * mult);
 }
 
 /**
- * Re-rank search results by the listener's taste WITHOUT ever overriding the
- * query-match order: results are grouped into relevance buckets from the
- * server's rel score (exact ≫ prefix ≫ phrase ≫ tokens), and taste only
- * re-orders INSIDE a bucket — your top artists and your listening language
- * float up, a different language sinks a little. A perfect but unknown match
- * still beats a half-match by your favourite artist.
+ * Re-rank search results — YouTube's feel with the listener's taste:
+ *
+ *   1. query-match bucket   — a perfect match always beats a half-match
+ *                             (exact ≫ prefix ≫ phrase ≫ tokens, from rel)
+ *   2. LANGUAGE priority    — the languages the user actually listens to
+ *                             float up at equal relevance; a language they
+ *                             never play sinks; unknown language = neutral
+ *   3. MOST-PLAYED on top   — within a bucket, the highest play counts come
+ *                             first and the least played sink down the list
+ *                             (the user's explicit rule)
+ *   4. familiar artists     — the user's own top artists as the final tiebreak
+ *
+ * Taste NEVER overrides a relevance bucket: the exact song the user typed is
+ * always the top of the list; taste decides the order of everything below it.
  */
 export function tasteRank(tracks: Track[], rels: number[]): Track[] {
   try {
     const fam = new Set(topArtists(10).map((a) => foldName(a)).filter(Boolean));
-    const tLang = tasteLangOf();
-    if (fam.size === 0 && !tLang) return tracks;
+    const langW = tasteLangWeights();
+    if (fam.size === 0 && langW.size === 0) return tracks;
     const bucket = (rel: number) => (rel >= 9000 ? 4 : rel >= 4500 ? 3 : rel >= 1800 ? 2 : rel > 0 ? 1 : 0);
     const scored = tracks.map((t, i) => {
       const primary = (t.artist || "").split(",")[0].trim().toLowerCase();
       let taste = 0;
       if (primary && fam.has(primary)) taste += 3;
       else if (primary && [...fam].some((f) => f.includes(primary) || primary.includes(f))) taste += 1;
-      if (t.lang && tLang && t.lang === tLang) taste += 1.5;
-      else if (t.lang && tLang && t.lang !== tLang) taste -= 0.5;
-      return { t, key: bucket(rels[i] ?? 0) * 10 + taste, i };
+      // language priority: listened languages by play weight · unknown = neutral ·
+      // a language the user never listens to sinks below both
+      const langBoost = t.lang ? (langW.get(t.lang) ?? -1) : 0;
+      return { t, relB: bucket(rels[i] ?? 0), langBoost, views: playsNum(t.plays), taste, i };
     });
-    scored.sort((a, b) => b.key - a.key || a.i - b.i);
+    scored.sort(
+      (a, b) =>
+        b.relB - a.relB ||
+        b.langBoost - a.langBoost ||
+        b.views - a.views ||
+        b.taste - a.taste ||
+        a.i - b.i
+    );
     return scored.map((x) => x.t);
   } catch {
     return tracks;
@@ -287,6 +316,39 @@ export async function albumBrowseApi(browseId: string): Promise<AlbumBrowseResul
   if (!res.ok) return null;
   const data = (await res.json()) as { album?: Parameters<typeof packAlbumDetail>[0] };
   return data.album ? packAlbumDetail(data.album) : null;
+}
+
+export interface VideoAlbumResolution {
+  /** The exact album page when YouTube's linkage + browse landed it. */
+  page: AlbumBrowseResult | null;
+  /** The REAL album name YouTube reports for this video (when no page landed) —
+   *  the only name worth trying in a fallback ladder. */
+  albumName?: string;
+}
+
+/**
+ * The EXACT album behind a SONG (videoId) — YouTube's own song→album linkage
+ * from the watch-next seed row (MPREb_ run), then the album page browse.
+ * This replaced name-guessing: "Chitti" by title search resolved a junk
+ * 229-play album of the same name; the linkage lands "Jathi Ratnalu" exactly.
+ */
+export async function albumForVideoApi(videoId: string): Promise<VideoAlbumResolution> {
+  if (IS_NATIVE) {
+    const { albumOfVideo, resolveAlbumForVideo } = await import("./yt/album");
+    const page = await resolveAlbumForVideo(videoId).catch(() => null);
+    if (page) return { page: packAlbumDetail(page) };
+    const link = await albumOfVideo(videoId).catch(() => null);
+    return { page: null, albumName: link?.albumName };
+  }
+  try {
+    const res = await fetch(`/api/album?videoId=${encodeURIComponent(videoId)}`);
+    if (!res.ok) return { page: null };
+    const data = (await res.json()) as { album?: Parameters<typeof packAlbumDetail>[0]; albumName?: string | null };
+    if (data.album) return { page: packAlbumDetail(data.album) };
+    return { page: null, albumName: data.albumName ?? undefined };
+  } catch {
+    return { page: null };
+  }
 }
 
 // ── Search suggestions (YouTube typing behavior) ────────────────────────────
