@@ -209,16 +209,23 @@ export async function searchAlbums(query: string): Promise<SearchAlbum[]> {
   return scored.slice(0, 12).map((x) => x.a);
 }
 
-/** The best album entity for a query, or null. */
+/** The best album entity for a query, or null.
+ *
+ * Title match FIRST, artist bias only WITHIN title-matching entities — the
+ * old order let the artist bias pick a DIFFERENT album by the same singer
+ * ("Jathi Ratnalu" + Ram Miriyala → "DJ Tillu") over the actual title match.
+ */
 export async function findAlbum(query: string, artist?: string): Promise<SearchAlbum | null> {
   const albums = await searchAlbums(query);
   if (albums.length === 0) return null;
+  const titleMatch = albums.filter((a) => foldIncludes(a.title, query));
+  const pool = titleMatch.length > 0 ? titleMatch : albums;
   if (artist) {
     const fa = fold(artist.split(",")[0]);
-    const byArtist = albums.find((a) => fa && fold(a.artist).includes(fa));
+    const byArtist = pool.find((a) => fa && fold(a.artist).includes(fa));
     if (byArtist) return byArtist;
   }
-  return albums[0];
+  return pool[0];
 }
 
 // ── exact album page (browse) ─────────────────────────────────────────────────
@@ -379,4 +386,166 @@ export async function resolveAlbumByName(name: string, artist?: string): Promise
   const entity = await findAlbum(name, artist);
   if (!entity) return null;
   return browseAlbum(entity.browseId);
+}
+
+// ── song → album LINKAGE (the exact path — YouTube's own metadata) ──────────
+
+/**
+ * Name-based album resolution is UNTRUSTWORTHY (proven live, 2026-11):
+ * resolving "Chitti" (Jathi Ratnalu) by name opened a junk 229-play album
+ * named "Chitti" from another artist, and the artist bias preferred a
+ * DIFFERENT album by the same singer ("DJ Tillu") over the title match.
+ * The trustworthy link is the InnerTube `next` watch-next queue: its seed
+ * row carries YouTube's OWN metadata for that exact videoId —
+ * longBylineText runs = [artist → MUSIC_PAGE_TYPE_ARTIST, " • ",
+ * album → MUSIC_PAGE_TYPE_ALBUM + MPREb_ browseId, " • ", year].
+ * Verified live with Chitti/QgqwqmcuZgk → MPREb_WUc2UwM2EhG ("Jathi Ratnalu").
+ */
+
+export interface VideoAlbumLink {
+  /** The REAL album name YouTube attached to this exact video. */
+  albumName: string;
+  /** MPREb_ browse target when the row links the album page (usually does). */
+  browseId?: string;
+}
+
+/** Recursively collect playlistPanelVideoRenderer nodes (same shape radio.ts parses). */
+function collectPanels(node: any, out: any[] = [], depth = 0): any[] {
+  if (!node || typeof node !== "object" || depth > 15) return out;
+  if (Array.isArray(node)) {
+    for (const x of node) collectPanels(x, out, depth + 1);
+    return out;
+  }
+  if (node.playlistPanelVideoRenderer) out.push(node.playlistPanelVideoRenderer);
+  for (const k of Object.keys(node)) collectPanels(node[k], out, depth + 1);
+  return out;
+}
+
+const linkCache = new Map<string, VideoAlbumLink | null>();
+const linkInflight = new Map<string, Promise<VideoAlbumLink | null>>();
+
+/**
+ * The album YouTube itself links to this exact videoId — via the watch-next
+ * queue row (RDAMVM mix, the one surface radio.ts already proved accessible).
+ * Album names may be arbitrary ("Jathi Ratnalu" vs "Jathiratnalu"), so we
+ * NEVER parse-guess: the MPREb_ run text is the album, full stop.
+ * Cached forever — a video's album never changes. Never throws.
+ */
+export async function albumOfVideo(videoId: string): Promise<VideoAlbumLink | null> {
+  const id = (videoId || "").trim();
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id)) return null;
+  const hit = linkCache.get(id);
+  if (hit !== undefined) return hit;
+  const pending = linkInflight.get(id);
+  if (pending) return pending;
+
+  const p = (async () => {
+    try {
+      await sessionReady();
+    } catch {
+      /* /next answers without a visitor id too (radio parity) */
+    }
+    let res: Response;
+    try {
+      res = await fetch(`${API_YTM}/next?key=${INNERTUBE_KEY}&prettyPrint=false`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-YouTube-Client-Name": WEB_REMIX.id,
+          "X-YouTube-Client-Version": WEB_REMIX.version,
+          "X-Origin": "https://music.youtube.com",
+          Referer: "https://music.youtube.com/",
+          "User-Agent": WEB_REMIX.userAgent,
+          ...(getVisitorData() ? { "X-Goog-Visitor-Id": getVisitorData()! } : {}),
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: WEB_REMIX.name,
+              clientVersion: WEB_REMIX.version,
+              gl: "IN",
+              hl: "en",
+              visitorData: getVisitorData() ?? undefined,
+            },
+          },
+          videoId: id,
+          playlistId: `RDAMVM${id}`,
+        }),
+        signal: AbortSignal.timeout(12000),
+      });
+    } catch {
+      return null;
+    }
+    if (!res.ok) return null;
+    const raw = await res.json();
+
+    // the seed row IS in the queue panel (radio.ts filters it out — it's there)
+    const panels = collectPanels(raw);
+    const seed = panels.find((p2) => p2?.navigationEndpoint?.watchEndpoint?.videoId === id) ?? panels[0];
+    if (!seed) return null;
+
+    // 1) exact: an MPREb_ run (album pages are MPREb_; artist runs are UCK…)
+    const runs: any[] = [
+      ...(seed.longBylineText?.runs ?? []),
+      ...((seed.flexColumns ?? []).flatMap((c: any) => c?.musicResponsiveListItemFlexColumnRenderer?.text?.runs ?? [])),
+    ];
+    for (const r of runs) {
+      const bid = r?.navigationEndpoint?.browseEndpoint?.browseId;
+      if (typeof bid === "string" && bid.startsWith("MPREb_")) {
+        const name = (r.text ?? "").trim();
+        if (name) return { albumName: name, browseId: bid };
+      }
+    }
+
+    // 2) fallback: the byline TEXT is "Artist • Album • Year" — the album is
+    //    the segment that isn't the artist (first) or a year/duration
+    const byline = runsText(seed.longBylineText ?? seed.shortBylineText);
+    const segs = byline.split("•").map((x) => x.trim()).filter(Boolean);
+    const albumSeg = segs.slice(1).find((s) => !/^\d{4}\b/.test(s) && !/^\d{1,2}:\d{2}$/.test(s) && s !== runsText(seed.title));
+    if (albumSeg) return { albumName: albumSeg };
+    return null;
+  })();
+
+  linkInflight.set(id, p);
+  const out = await p;
+  linkInflight.delete(id);
+  linkCache.set(id, out);
+  return out;
+}
+
+/**
+ * The EXACT album page behind a videoId: linkage → browse (one hop, YouTube's
+ * own connection). Falls back to a name entity-search ONLY on the real album
+ * name YouTube reported — never on the song title. Null when YTM has no
+ * album page for the video (UGC covers, most uploads).
+ *
+ * SINGLE ESCALATION: movie art-tracks often link a 1-track single release
+ * ("Samajavaragamana" → the "Ala Vaikunthapurramuloo" single). When that
+ * happens we look for a bigger album entity with the same name and switch to
+ * it ONLY if its tracklist literally contains the single's own track — so the
+ * movie OST wins without ever trusting a bare name match.
+ */
+export async function resolveAlbumForVideo(videoId: string): Promise<AlbumDetail | null> {
+  const link = await albumOfVideo(videoId);
+  if (!link) return null;
+  if (link.browseId) {
+    const page = await browseAlbum(link.browseId);
+    if (page && page.tracks.length > 1) return page;
+    if (page && page.tracks.length === 1) {
+      const anchor = page.tracks[0].videoId; // the release's canonical track
+      const entities = await searchAlbums(page.title).catch(() => []);
+      for (const e of entities.slice(0, 4)) {
+        if (e.browseId === page.browseId) continue;
+        if (!foldIncludes(e.title, page.title)) continue;
+        const bigger = await browseAlbum(e.browseId).catch(() => null);
+        if (bigger && bigger.tracks.length > page.tracks.length && bigger.tracks.some((t) => t.videoId === anchor)) {
+          return bigger;
+        }
+      }
+      return page;
+    }
+  }
+  // rare: the row named the album without linking a page — try the entity
+  // search on THAT name (still YouTube's own naming, not our guess)
+  return resolveAlbumByName(link.albumName);
 }

@@ -7,6 +7,7 @@ import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, getNativePlay
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import { rememberHeard, filterFresh, isStaleSession } from "./queueVariety";
+import { baseTitle, capArtists, relateBlock } from "./queueBlock";
 import * as ytEmbed from "./ytEmbed";
 import {
   initMediaSession,
@@ -129,62 +130,52 @@ async function shapeForMode(mode: RadioMode, pool: Track[], seedTrack: QTrack | 
 }
 
 /**
- * Lead an autoplay block with the seed song's own artist/composer (up to 5), so the
- * "similar vibe / related artist" promise is literally visible in the first rows —
- * YTM mixes do the same: the seed's artist dominates the top of the block.
+ * Same-language top-up for thin radio blocks — the queue must stay full WITHOUT
+ * crossing the language barrier. Queries are all in the seed's world: its
+ * language's hits, its own artist in that language, and its movie/album
+ * soundtrack. Results still pass through the strict block builder, so only
+ * in-language tracks can ever survive.
  */
-function promoteSeedArtist(seed: Track, pool: Track[]): Track[] {
-  const keys = new Set(seed.artist.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean));
-  if (keys.size === 0) return pool;
-  const same: Track[] = [];
-  const rest: Track[] = [];
-  for (const t of pool) {
-    const match = t.artist.split(",").some((a) => keys.has(a.trim().toLowerCase()));
-    if (match && same.length < 5) same.push(t);
-    else rest.push(t);
+async function sameLangTopUp(seed: Track, langOf: (t: Track) => Lang | undefined): Promise<Track[]> {
+  const lang = langOf(seed);
+  const artistFirst = seed.artist.split(",")[0].trim();
+  const album = (seed.movie || seed.album || "").trim();
+  const queries = [
+    lang ? `${lang.toLowerCase()} hit songs` : "",
+    lang && artistFirst.length > 2 ? `${artistFirst} ${lang.toLowerCase()} songs` : "",
+    album.length >= 3 ? `${album} songs` : "",
+  ].filter(Boolean);
+  const settled = await Promise.allSettled(queries.map((squery) => searchApi(squery)));
+  const out: Track[] = [];
+  const seen = new Set<string>([seed.id]);
+  for (const s of settled) {
+    if (s.status !== "fulfilled") continue;
+    for (const t of s.value) {
+      if (!seen.has(t.id)) {
+        seen.add(t.id);
+        out.push(t);
+      }
+    }
   }
-  return [...same, ...rest];
-}
-
-/** "(Telugu)", "(From "Aashiqui 2")", "– Hindi", version suffixes — noise hiding that two titles are the same song. */
-const TITLE_NOISE_RE =
-  /\s*\((?:from[^)]*|\b\d{4}\b|telugu|hindi|tamil|kannada|malayalam|punjabi|bengali|english|version|reprised?|unplugged|acoustic|lo-?fi)\)\s*|\s[-–]\s*(?:telugu|hindi|tamil|kannada|malayalam)\s*$/gi;
-
-/** "Massa Massa (Hindi)" and "Massa Massa (Telugu)" collapse to the same base song. */
-function baseTitle(title: string): string {
-  return title.replace(TITLE_NOISE_RE, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  return out;
 }
 
 /**
- * YTM language-stationary radio: a radio seeded by a Telugu song STAYS Telugu.
- * YouTube's raw mix drifts across languages for multilingual composers (an A.R. Rahman
- * seed returns his Hindi/Kannada/Tamil versions), so the block is rebuilt in language
- * buckets — seed-language tracks first (its own artist/composer leading them), then
- * tracks whose language we can't detect, and other languages only as filler when the
- * in-language pool can't nearly fill a block. The same song in another language
- * ("Massa Massa (Hindi)" behind "(Telugu)") counts as drift, not variety.
+ * Lead an autoplay block with the seed song's own artist/composer (up to 5), so the
+ * "similar vibe / related artist" promise is literally visible in the first rows —
+ * YTM mixes do the same: the seed's artist dominates the top of the block.
+ * (Implementation lives in queueBlock.ts — pure + unit-tested.)
  */
-function relateBlock(seed: Track, pool: Track[]): Track[] {
-  // the seed can be a romanized live track too — infer before locking the block
-  const lang = detectTrackLang(seed) ?? inferLiveLang(seed);
-  if (!lang) return promoteSeedArtist(seed, pool);
-  const seedBase = baseTitle(seed.title);
-  const isVariant = (t: Track) => baseTitle(t.title) === seedBase;
-  // language of a pool track: explicit marker / native script first, then the
-  // catalog-backed inference (movie names + artist profiles) for romanized titles
-  const langOf = (t: Track) => detectTrackLang(t) ?? inferLiveLang(t, lang);
-  const same = pool.filter((t) => langOf(t) === lang && !isVariant(t));
-  const unknown = pool.filter((t) => langOf(t) === undefined && !isVariant(t));
-  const other = pool.filter((t) => {
-    const l = langOf(t);
-    return (l !== undefined && l !== lang) || isVariant(t);
-  });
-  const head = promoteSeedArtist(seed, same);
-  const tail =
-    same.length + unknown.length >= 10
-      ? promoteSeedArtist(seed, unknown) // plenty in-language → no drift this block
-      : promoteSeedArtist(seed, [...unknown, ...other]); // thin pool → drift as filler, artist-led
-  return [...head, ...tail];
+
+/**
+ * YTM language-stationary radio, hardened into a BARRIER (the user's rule):
+ * a radio seeded by a Telugu song STAYS Telugu — other languages are dropped
+ * outright, never kept as filler when the pool is thin (thin pools are topped
+ * up with same-language searches instead). See queueBlock.ts relateBlock.
+ */
+function langLockFor(seed: Track): (t: Track) => Lang | undefined {
+  const seedLang = detectTrackLang(seed) ?? inferLiveLang(seed);
+  return (t: Track) => detectTrackLang(t) ?? inferLiveLang(t, seedLang);
 }
 
 /**
@@ -224,33 +215,6 @@ export function balancedShuffle<T extends { artist: string }>(tracks: T[]): T[] 
   // every track belongs to exactly one group and every group found a free slot,
   // so `out` is fully populated at this point.
   return out as T[];
-}
-
-/**
- * Artist cap per radio block — the anti-"queue full of one artist" rule (the
- * user-facing bug: play one Sushin Shyam song, get ONLY Sushin Shyam back).
- * A regular artist contributes at most 2 songs per block; the seed song's own
- * artist/composer keeps 3 so the "similar vibe" promise stays visible up top.
- * Combined with balancedShuffle (below), the queue reads like a playlist, not
- * a discography.
- */
-function capArtists(pool: Track[], seedArtist: string): Track[] {
-  const ARTIST_CAP = 2;
-  const SEED_CAP = 3;
-  const seedKeys = new Set(seedArtist.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean));
-  const counts = new Map<string, number>();
-  const out: Track[] = [];
-  for (const t of pool) {
-    const parts = t.artist.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
-    const key = parts[0] || t.artist.toLowerCase();
-    const isSeed = parts.some((a) => seedKeys.has(a));
-    const cap = isSeed ? SEED_CAP : ARTIST_CAP;
-    const n = counts.get(key) ?? 0;
-    if (n >= cap) continue;
-    counts.set(key, n + 1);
-    out.push(t);
-  }
-  return out;
 }
 
 /**
@@ -1053,8 +1017,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }
         if (mySeq !== loadSeqRef.current) return; // superseded — never play a stale song
         loadedIdRef.current = t.id;
-        // log to listening history (drives the personalized home feed) — real id when resolved
-        recordPlay({ id: t.id, title: t.title, artist: t.artist, cover: t.cover });
+        // log to listening history (drives the personalized home feed) — real id when
+        // resolved; language frozen now so the search taste profile stays exact even
+        // for romanized titles (they can't be re-detected later)
+        recordPlay({ id: t.id, title: t.title, artist: t.artist, cover: t.cover, lang: t.lang ?? detectTrackLang(t) ?? inferLiveLang(t) });
         // variety memory: this song was heard now — radio blocks built tomorrow skip it
         rememberHeard([t.id]);
         loadDirect(t);
@@ -1104,12 +1070,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           ranked = shaped.length > 0 ? shaped : pool; // a flavor that yields nothing must never kill playback
         }
         const haveBases = new Set(q.map((x) => baseTitle(x.title))); // blocks the same song in another language
+        // a lang:<X> chip is the USER's explicit choice — it overrides the seed's own
+        // language for the block (that's not drift, that's a request)
+        const chipLang = mode.startsWith("lang:") ? (mode.slice(5) as Lang) : undefined;
+        const langOf = langLockFor(seedTrack);
         const build = (src: Track[]) => {
-          // VARIETY PIPELINE (see queueVariety.ts): language-locked relateBlock →
-          // artist cap (max 2 per artist, seed artist 3) → artist-spaced random
-          // shuffle → drop songs heard on previous days → taste boost → block.
+          // VARIETY PIPELINE (see queueVariety.ts + queueBlock.ts): HARD language
+          // barrier (other languages DROPPED — never filler) → artist cap (max 2
+          // per artist, seed artist 3) → artist-spaced random shuffle → drop songs
+          // heard on previous days → taste boost → block.
           // Same seed, new day = a completely different queue; same day = same flow.
-          const candidates = relateBlock(seedTrack, src).filter((t) => {
+          const candidates = relateBlock(seedTrack, src, langOf, chipLang).filter((t) => {
             if (t.id === seedTrack.id || q.some((x) => x.id === t.id)) return false;
             const tb = baseTitle(t.title);
             return !haveBases.has(tb);
@@ -1142,6 +1113,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             }
           }
           add = build(fb);
+        }
+        // LANGUAGE BARRIER + FULL QUEUE: a strict block can come up short when the
+        // Mix pool itself is cross-language (multilingual composers). Top it up with
+        // SAME-language searches — never with other-language filler.
+        if (add.length > 0 && add.length < 8) {
+          const topUp = await sameLangTopUp(seedTrack, langOf);
+          const have = new Set(add.map((x) => x.id));
+          add = [...add, ...build(topUp).filter((x) => !have.has(x.id))].slice(0, 15);
         }
         if (add.length === 0) {
           radioTriedRef.current.delete(key); // even search came up dry — end-of-line may retry
@@ -1902,9 +1881,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           try {
             const tracks = await radioApi(t.id, { title: t.title, artist: t.artist });
             const exclude = new Set(queueRef.current.map((x) => x.id));
-            // same variety pipeline as the autoplay blocks (cap → space → fresh → taste)
+            // same variety pipeline as the autoplay blocks — INCLUDING the hard
+            // language barrier (this path used to skip it: menu-started radios
+            // were the #1 source of other-language songs in the queue)
             const add = familiarBoost(
-                filterFresh(balancedShuffle(capArtists(tracks.filter((x) => !exclude.has(x.id) && x.id !== t.id), t.artist)))
+                filterFresh(
+                  balancedShuffle(
+                    capArtists(
+                      relateBlock(t, tracks, langLockFor(t)).filter((x) => !exclude.has(x.id) && x.id !== t.id),
+                      t.artist
+                    )
+                  )
+                )
               )
               .slice(0, 30)
               .map((x) => ({ ...x, uid: `r:${x.id}:${uidSeqRef.current++}`, layer: "radio" as const }));

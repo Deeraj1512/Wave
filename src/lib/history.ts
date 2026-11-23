@@ -20,6 +20,9 @@ export interface HistoryEntry {
   cover?: string;
   at: number; // last-played epoch ms
   n: number; // play count
+  /** language frozen at play time (catalog lang or catalog-backed inference) —
+   *  romanized titles can't be re-detected later, so we remember it now */
+  lang?: string;
 }
 
 const LS_KEY = "dhun.history.v1";
@@ -63,7 +66,7 @@ export function historyVersion(): number {
   return version;
 }
 
-export function recordPlay(t: { id: string; title: string; artist: string; cover?: string }) {
+export function recordPlay(t: { id: string; title: string; artist: string; cover?: string; lang?: string }) {
   hydrate();
   if (!t.id || !t.title) return;
   const prev = byId.get(t.id);
@@ -72,6 +75,7 @@ export function recordPlay(t: { id: string; title: string; artist: string; cover
     at: Date.now(),
     n: (prev?.n ?? 0) + 1,
     cover: t.cover ?? prev?.cover,
+    lang: t.lang ?? prev?.lang,
   });
   // cap + keep the freshest
   if (byId.size > CAP) {
@@ -94,6 +98,7 @@ export interface RecentPlay {
   cover?: string;
   at: number;
   n: number;
+  lang?: string;
 }
 
 /** Most recent plays, deduped by song identity (id swaps like t01→videoId collapse). */
@@ -105,7 +110,7 @@ export function recentPlays(limit = 10): RecentPlay[] {
     const key = `${e.title.toLowerCase().trim()}|${e.artist.split(",")[0].toLowerCase().trim()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ id: e.id, title: e.title, artist: e.artist, cover: e.cover, at: e.at, n: e.n });
+    out.push({ id: e.id, title: e.title, artist: e.artist, cover: e.cover, at: e.at, n: e.n, lang: e.lang });
     if (out.length >= limit) break;
   }
   return out;

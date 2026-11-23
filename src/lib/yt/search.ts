@@ -139,6 +139,14 @@ export interface SearchResponse {
   attempts: string[];
 }
 
+/**
+ * How many continuation pages a filtered attempt (songs/videos) may pull behind
+ * its first page — this is what makes the result list LONG like YouTube's
+ * ("the whole list should appear, not just six or seven songs"). Each page is
+ * ~20 raw rows; 3 pages ≈ 60-80 rows before the originals-only filter.
+ */
+const CONTINUATION_LIMIT = 3;
+
 export async function searchOriginals(query: string): Promise<SearchResponse> {
   // dropUgc: search is a LISTENING surface — tier 3 (UGC under 100k views) is
   // exactly the "random unknown songs" the user reported. Radio/stream fallbacks
@@ -195,49 +203,64 @@ async function runSearch(
   for (let i = 0; i < attemptsSpec.length; i++) {
     const [label, params] = attemptsSpec[i];
     attempts.push(label);
-    let res: Response;
-    try {
-      res = await fetch(`${API_YTM}/search?key=${INNERTUBE_KEY}&prettyPrint=false`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-YouTube-Client-Name": WEB_REMIX.id,
-          "X-YouTube-Client-Version": WEB_REMIX.version,
-          "X-Origin": "https://music.youtube.com",
-          Referer: "https://music.youtube.com/",
-          "User-Agent": WEB_REMIX.userAgent,
-          ...(getVisitorData() ? { "X-Goog-Visitor-Id": getVisitorData()! } : {}),
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: WEB_REMIX.name,
-              clientVersion: WEB_REMIX.version,
-              gl: "IN",
-              hl: "en",
-              visitorData: getVisitorData() ?? undefined,
-            },
-          },
-          query,
-          ...(params ? { params: decodeURIComponent(params) } : {}),
-        }),
-        signal: AbortSignal.timeout(12000),
-      });
-    } catch {
-      continue; // network hiccup on this attempt — try the next one
-    }
-    if (!res.ok) continue;
 
-    const raw = await res.json();
-    const items = collectItems(raw);
-    // album entities ride along in the same response (the unfiltered attempt's
-    // ALBUMS shelf) — free access, no second request
+    const postSearch = async (body: Record<string, unknown>): Promise<any | null> => {
+      try {
+        const res = await fetch(`${API_YTM}/search?key=${INNERTUBE_KEY}&prettyPrint=false`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": WEB_REMIX.id,
+            "X-YouTube-Client-Version": WEB_REMIX.version,
+            "X-Origin": "https://music.youtube.com",
+            Referer: "https://music.youtube.com/",
+            "User-Agent": WEB_REMIX.userAgent,
+            ...(getVisitorData() ? { "X-Goog-Visitor-Id": getVisitorData()! } : {}),
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(12000),
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null; // network hiccup on this page — the pages we have still answer
+      }
+    };
+    const ctx = {
+      context: {
+        client: {
+          clientName: WEB_REMIX.name,
+          clientVersion: WEB_REMIX.version,
+          gl: "IN",
+          hl: "en",
+          visitorData: getVisitorData() ?? undefined,
+        },
+      },
+    };
+
+    const first = await postSearch({ ...ctx, query, ...(params ? { params: decodeURIComponent(params) } : {}) });
+    if (!first) continue;
+
+    // album entities ride along in the FIRST page (the unfiltered attempt's
+    // ALBUMS shelf) — free access, no second request; continuations don't carry shelves
     if (albums.length < 12) {
-      for (const a of parseAlbumRows(items)) {
+      for (const a of parseAlbumRows(collectItems(first))) {
         if (!albums.some((x) => x.browseId === a.browseId)) albums.push(a);
       }
     }
-    const parsed = items.map(parseItem).filter((x): x is ParsedItem => x !== null);
+
+    // LONG LIST — follow the continuation chain of filtered attempts so the
+    // result list goes on like YouTube's instead of stopping at one page.
+    const rawItems = collectItems(first);
+    let cont = params ? nextContinuationOf(first) : null;
+    for (let p = 0; cont && p < CONTINUATION_LIMIT; p++) {
+      const next = await postSearch({ ...ctx, continuation: cont });
+      if (!next) break;
+      rawItems.push(...collectItems(next));
+      cont = nextContinuationOf(next);
+    }
+
+    const parsed = rawItems.map(parseItem).filter((x): x is ParsedItem => x !== null);
     const classified = parsed.map(classify);
     const { clean } = sanitize(classified);
     for (const [k, v] of Object.entries(classifiedDrops(classified))) bump(k);
@@ -284,6 +307,33 @@ async function runSearch(
     // weak top result → fall through and merge the next attempt's results
   }
   return { query, tracks: [], albums, dropped, attempts };
+}
+
+/**
+ * The next-page token of a search response. The token hides in different
+ * renderers per shape (first page: musicShelfRenderer.continuations; following
+ * pages: continuationContents.musicShelfContinuation…) — a recursive scan for
+ * nextContinuationData covers every shape without coupling to one layout.
+ */
+function nextContinuationOf(raw: any): string | null {
+  let found: string | null = null;
+  const scan = (node: any, d: number) => {
+    if (found || !node || typeof node !== "object" || d > 20) return;
+    if (Array.isArray(node)) {
+      for (const x of node) scan(x, d + 1);
+      return;
+    }
+    for (const k of Object.keys(node)) {
+      if (k === "nextContinuationData") {
+        const c = node[k]?.continuation;
+        if (typeof c === "string" && c.length > 0) found = c;
+        return;
+      }
+      scan(node[k], d + 1);
+    }
+  };
+  scan(raw, 0);
+  return found;
 }
 
 function classifiedDrops(classified: SearchTrack[]): Record<string, number> {
