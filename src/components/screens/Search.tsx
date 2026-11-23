@@ -1,13 +1,13 @@
 "use client";
 
 import { useMemo, useRef, useState, useEffect } from "react";
-import { Clock, Disc3, Play, Search, WifiOff, X } from "lucide-react";
+import { Clock, Disc3, Loader2, Play, Search, WifiOff, X } from "lucide-react";
 import { TrackRow } from "../TrackRow";
 import { Cover } from "../Cover";
-import { useCover } from "@/lib/covers";
 import { GENRE_TILES } from "@/lib/data";
-import { searchApi } from "@/lib/api";
+import { searchFullApi, albumSearchApi, albumBrowseApi, suggestApi, type ApiAlbum } from "@/lib/api";
 import { groupAlbums, registerAlbum } from "@/lib/albums";
+import { useToast } from "@/hooks/use-toast";
 import type { Track } from "@/lib/types";
 import { AlbumView } from "./AlbumView";
 
@@ -44,7 +44,24 @@ function pushRecent(q: string) {
   return next;
 }
 
+/** One album card — either an Innertube entity (browseId → exact page) or a
+ *  legacy search-group fallback (pre-collected tracks). */
+interface AlbumCard {
+  key: string;
+  name: string;
+  artist?: string;
+  year?: string;
+  thumb?: string;
+  browseId?: string;
+  tracks?: Track[];
+  cover?: string;
+  colors?: [string, string];
+  seed?: string;
+  count?: number;
+}
+
 export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string; seedKey?: number }) {
+  const { toast } = useToast();
   const [q, setQ] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -80,6 +97,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
   // Real search through the Wave backend — no mock fallback. A failed search shows
   // an honest error (scoped to the query it failed for) instead of fake results.
   const [results, setResults] = useState<Track[]>([]);
+  const [albumEntities, setAlbumEntities] = useState<ApiAlbum[]>([]);
   const [searching, setSearching] = useState(false);
   const [failure, setFailure] = useState<{ q: string } | null>(null);
   useEffect(() => {
@@ -88,19 +106,22 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
     const t = setTimeout(() => {
       if (!query) {
         setResults([]);
+        setAlbumEntities([]);
         setSearching(false);
         return;
       }
       setSearching(true);
-      searchApi(query, ctrl.signal)
-        .then((ts) => {
-          setResults(ts);
+      searchFullApi(query, ctrl.signal)
+        .then(({ tracks, albums }) => {
+          setResults(tracks);
+          setAlbumEntities(albums);
           setFailure(null);
           setSearching(false);
         })
         .catch((e) => {
           if (e?.name === "AbortError") return;
           setResults([]);
+          setAlbumEntities([]);
           setFailure({ q: query });
           setSearching(false);
         });
@@ -111,14 +132,102 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
     };
   }, [q]);
 
-  // Album search — "type the album, find its songs": group the results by their
-  // parsed album byline; the Albums tab shows these as cards.
-  const albums = useMemo(() => groupAlbums(results, q), [results, q]);
+  // ── Suggestions — YouTube's typing behavior: 2 letters in, the song comes
+  //    back as a tappable completion. Never blocks or breaks search. ──
+  const [sugs, setSugs] = useState<string[]>([]);
+  useEffect(() => {
+    const query = q.trim();
+    if (query.length < 2) {
+      setSugs([]);
+      return;
+    }
+    let alive = true;
+    const t = setTimeout(() => {
+      suggestApi(query)
+        .then((s) => alive && setSugs(s.slice(0, 10)))
+        .catch(() => alive && setSugs([]));
+    }, 180);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [q]);
+
+  // Album groups from the song results (legacy lane, still useful when the
+  // entity shelf didn't arrive) — merged with the REAL Innertube album entities.
+  const grouped = useMemo(() => groupAlbums(results, q), [results, q]);
+
+  const albumCards: AlbumCard[] = useMemo(() => {
+    const out: AlbumCard[] = [];
+    const seen = new Set<string>();
+    for (const a of albumEntities) {
+      const k = a.title.toLowerCase().replace(/\s+/g, " ").trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push({ key: k, name: a.title, artist: a.artist, year: a.year, thumb: a.thumb, browseId: a.browseId });
+    }
+    for (const g of grouped) {
+      if (seen.has(g.key)) continue;
+      seen.add(g.key);
+      out.push({
+        key: g.key,
+        name: g.name,
+        artist: g.artist,
+        tracks: g.tracks,
+        cover: g.cover,
+        count: g.tracks.length,
+        colors: g.tracks[0].colors,
+        seed: g.tracks[0].id,
+      });
+    }
+    return out.slice(0, 12);
+  }, [albumEntities, grouped]);
+
   // Opening an album page swaps the results view; the key is scoped to the query
   // it was opened from, so typing a new query returns to results (render-time
   // adjustment — no effect needed).
   const [openAlbum, setOpenAlbum] = useState<{ key: string; q: string } | null>(null);
   const albumOpen = openAlbum && openAlbum.q === q ? openAlbum.key : null;
+
+  // Opening an Innertube album entity = one browse roundtrip — busy state per card.
+  const [openingKey, setOpeningKey] = useState<string | null>(null);
+  const openCard = async (card: AlbumCard) => {
+    if (openingKey) return;
+    if (card.browseId) {
+      setOpeningKey(card.key);
+      try {
+        const page = await albumBrowseApi(card.browseId);
+        if (!page || page.tracks.length === 0) throw new Error("empty album");
+        const k1 = card.key;
+        const k2 = page.album.title.toLowerCase().replace(/\s+/g, " ").trim();
+        registerAlbum(k1, page.tracks);
+        if (k2 && k2 !== k1) registerAlbum(k2, page.tracks);
+        setOpenAlbum({ key: k1, q });
+        commitRecent(q);
+      } catch {
+        toast({ title: "Couldn't open this album", description: "Check your connection and try again", duration: 3000 });
+      } finally {
+        setOpeningKey(null);
+      }
+      return;
+    }
+    if (card.tracks) {
+      registerAlbum(card.key, card.tracks);
+      setOpenAlbum({ key: card.key, q });
+      commitRecent(q);
+    }
+  };
+
+  // Pinned album on the Songs tab — when the query IS an album name and an
+  // entity matched, the album surfaces FIRST (like YTM's top-result card).
+  const pinned: ApiAlbum | undefined = useMemo(() => {
+    const query = q.trim().toLowerCase();
+    if (query.length < 3) return undefined;
+    return albumEntities.find((a) => {
+      const n = a.title.toLowerCase();
+      return n === query || (n.length >= 4 && n.includes(query)) || (query.length >= 4 && query.includes(n));
+    });
+  }, [albumEntities, q]);
 
   // Result tabs — "Songs" is the classic track list, "Albums" narrows to album
   // cards. The tab row only exists while a query is active.
@@ -127,6 +236,27 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
     setTab(t);
     if (openAlbum) setOpenAlbum(null); // leaving the album page via the tabs
   };
+
+  // Albums tab with nothing? One dedicated entity search for the typed name —
+  // "type the album, find the album" must always work, even when the song
+  // search short-circuited confident (albums shelf absent).
+  const lastAlbumQuery = useRef<string>("");
+  useEffect(() => {
+    const query = q.trim();
+    if (tab !== "albums" || albumCards.length > 0 || !query || searching) return;
+    if (lastAlbumQuery.current === query) return;
+    lastAlbumQuery.current = query;
+    let alive = true;
+    albumSearchApi(query)
+      .then((list) => {
+        if (alive && list.length > 0) setAlbumEntities((prev) => (prev.length > 0 ? prev : list));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, q, searching, albumCards.length]);
 
   return (
     <div className="space-y-8 pb-8">
@@ -151,6 +281,25 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
             </button>
           )}
         </div>
+
+        {/* YouTube-style completions — tap one to run it */}
+        {q.trim() && sugs.length > 0 && (
+          <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto" aria-label="Search suggestions">
+            {sugs.map((s) => (
+              <button
+                key={s}
+                onClick={() => {
+                  setQ(s);
+                  commitRecent(s);
+                }}
+                className="shrink-0 rounded-full border border-border bg-surface-2 px-3.5 py-1.5 text-[13px] font-medium text-foreground/85 transition hover:bg-surface-3"
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
+
         {q.trim() && (
           <div className="mt-3 flex items-center gap-2" role="tablist" aria-label="Search result type">
             {(["songs", "albums"] as const).map((t) => (
@@ -198,30 +347,31 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
             <p className="mt-4 text-lg font-bold">Couldn&apos;t search just now</p>
             <p className="mt-1 text-sm text-muted-foreground">Check your connection and try again — your query is still in the box.</p>
           </div>
-        ) : results.length > 0 ? (
+        ) : results.length > 0 || albumCards.length > 0 ? (
           tab === "albums" ? (
-            albums.length > 0 ? (
+            albumCards.length > 0 ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-                {albums.map((a) => (
+                {albumCards.map((a) => (
                   <button
                     key={a.key}
-                    onClick={() => {
-                      registerAlbum(a.key, a.tracks);
-                      setOpenAlbum({ key: a.key, q });
-                      commitRecent(q);
-                    }}
+                    onClick={() => void openCard(a)}
+                    disabled={!!openingKey}
                     className="group rounded-2xl p-3 text-left transition hover:bg-surface-2"
                     aria-label={`Open album ${a.name}`}
                   >
                     <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30">
-                      {a.cover ? (
-                        <img src={a.cover} alt="" className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]" />
+                      {a.thumb || a.cover ? (
+                        <img src={(a.thumb ?? a.cover)!} alt="" className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]" />
                       ) : (
-                        <Cover from={a.tracks[0].colors[0]} to={a.tracks[0].colors[1]} seed={a.tracks[0].id} className="h-full w-full" />
+                        <Cover from={a.colors![0]} to={a.colors![1]} seed={a.seed!} className="h-full w-full" />
                       )}
                       <span className="absolute inset-0 flex items-end justify-start bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
                         <span className="flex h-10 w-10 m-3 items-center justify-center rounded-full bg-[var(--accent)] shadow-xl">
-                          <Play className="h-4 w-4 fill-black text-black" />
+                          {openingKey === a.key ? (
+                            <Loader2 className="h-4 w-4 animate-spin text-black" />
+                          ) : (
+                            <Play className="h-4 w-4 fill-black text-black" />
+                          )}
                         </span>
                       </span>
                     </span>
@@ -231,7 +381,9 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
                     </span>
                     <span className="mt-0.5 block truncate text-sm font-bold text-foreground">{a.name}</span>
                     <span className="block truncate text-xs text-muted-foreground">
-                      {a.artist ? `${a.artist} · ` : ""}{a.tracks.length} song{a.tracks.length === 1 ? "" : "s"}
+                      {a.artist ? `${a.artist} · ` : ""}
+                      {a.year ? `${a.year} · ` : ""}
+                      {a.count !== undefined ? `${a.count} song${a.count === 1 ? "" : "s"}` : "Album"}
                     </span>
                   </button>
                 ))}
@@ -249,10 +401,45 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
               </div>
             )
           ) : (
-            <div className="space-y-0.5">
-              {results.map((t) => (
-                <TrackRow key={t.id} track={t} radio />
-              ))}
+            <div className="space-y-4">
+              {/* pinned album — the query named an album, show it first */}
+              {pinned && !albumOpen && (
+                <button
+                  onClick={() => void openCard({ key: pinned.title.toLowerCase(), name: pinned.title, artist: pinned.artist, thumb: pinned.thumb, browseId: pinned.browseId })}
+                  disabled={!!openingKey}
+                  className="flex w-full items-center gap-4 rounded-2xl border border-border bg-surface-2 p-3 text-left transition hover:bg-surface-3"
+                >
+                  <span className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl">
+                    {pinned.thumb ? (
+                      <img src={pinned.thumb} alt="" className="h-full w-full object-cover" />
+                    ) : (
+                      <span className="flex h-full w-full items-center justify-center bg-surface-3">
+                        <Disc3 className="h-6 w-6 text-muted-foreground" />
+                      </span>
+                    )}
+                    {openingKey === pinned.title.toLowerCase() && (
+                      <span className="absolute inset-0 flex items-center justify-center bg-black/50">
+                        <Loader2 className="h-4 w-4 animate-spin text-white" />
+                      </span>
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <Disc3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Album</span>
+                    </span>
+                    <span className="mt-0.5 block truncate text-sm font-bold text-foreground">{pinned.title}</span>
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {pinned.artist ? `${pinned.artist} · ` : ""}Tap to open the full album
+                    </span>
+                  </span>
+                </button>
+              )}
+              <div className="space-y-0.5">
+                {results.map((t) => (
+                  <TrackRow key={t.id} track={t} radio />
+                ))}
+              </div>
             </div>
           )
         ) : (

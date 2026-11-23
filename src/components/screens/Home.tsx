@@ -4,7 +4,7 @@
  * Home feed — two sources only: YOUR data (history, likes) and the live server.
  * Layout is a verbatim YouTube Music home: chips → More to explore (paged 4-row
  * lists, swipe left for the next 4) → Quick picks (3×3 Speed dial matrix) →
- * Listen again → Mixed for you → Trending → Liked songs.
+ * Radio (artist profiles) → Listen again → Mixed for you → Trending → Liked songs.
  *  - Quick picks = your replays + your personal-radio pool (seeded from your most
  *    played song, so the mix stays in YOUR musical universe) + a couple of outside
  *    discoveries — re-mixed on every page load. The songs change on every refresh;
@@ -17,13 +17,15 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Play } from "lucide-react";
+import { Loader2, Music2, Play } from "lucide-react";
 import { Shelf } from "../Shelf";
 import { SongCard, QuickPick, SpeedDialTile } from "../Cards";
 import { usePlayer } from "@/lib/player";
+import { useToast } from "@/hooks/use-toast";
 import { colorFor, MOOD_CHIPS } from "@/lib/data";
 import { searchApi, radioApi } from "@/lib/api";
 import { recentPlays, radioSeed, subscribeHistory, historyVersion, seededRandom, seededShuffle, type RecentPlay } from "@/lib/history";
+import { radioArtists, artistImage, fold } from "@/lib/artistCatalog";
 import { catalogTracks } from "@/lib/catalog";
 import type { Track, Lang } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -255,6 +257,90 @@ function SkelQuickPicks() {
   );
 }
 
+/** "812M" → number, for picking the artist's most-played song as the radio seed. */
+function playsToNum(p: string): number {
+  const m = p.trim().match(/^([\d.]+)\s*([KMB])?$/i);
+  if (!m) return 0;
+  const mult = m[2]?.toUpperCase() === "B" ? 1e9 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "K" ? 1e3 : 1;
+  return (parseFloat(m[1]) || 0) * mult;
+}
+
+/**
+ * Radio — the artist-profile shelf (user's ask: radio is an OPTION, never the
+ * app's default behavior). Circular artist photos — your top listening artists
+ * first, curated cross-language names for cold start. Tap → that artist's radio:
+ * their top song seeds the queue, their songs fill the context, the smart radio
+ * grows behind it (language-locked, artist-capped).
+ */
+function RadioShelf({ onArtist, busy }: { onArtist: (name: string) => void; busy: string | null }) {
+  const [artists, setArtists] = useState<string[] | null>(null);
+  const [imgs, setImgs] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    // defer out of the effect body (react-compiler: no sync setState in effects)
+    const id = setTimeout(() => setArtists(radioArtists(10)), 0);
+    return () => clearTimeout(id);
+  }, []);
+
+  // resolve photos lazily, one by one, cached in localStorage by artistImage()
+  useEffect(() => {
+    if (!artists) return;
+    let alive = true;
+    const fetchAt = (i: number) => {
+      if (!alive || i >= artists.length) return;
+      artistImage(artists[i])
+        .then((url) => {
+          if (alive && url) setImgs((m) => (m[artists[i]] ? m : { ...m, [artists[i]]: url }));
+          fetchAt(i + 1);
+        })
+        .catch(() => fetchAt(i + 1));
+    };
+    fetchAt(0);
+    return () => {
+      alive = false;
+    };
+  }, [artists]);
+
+  if (!artists || artists.length === 0) return null;
+  return (
+    <section aria-label="Radio">
+      <div className="mb-4 px-1">
+        <h2 className="text-xl font-medium text-foreground sm:text-[22px]">Radio</h2>
+        <p className="mt-0.5 text-xs text-muted-foreground">Tap an artist to start their radio</p>
+      </div>
+      <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-1">
+        {artists.map((name) => {
+          const img = imgs[name];
+          const loading = busy === name;
+          return (
+            <button
+              key={name}
+              onClick={() => onArtist(name)}
+              disabled={!!busy}
+              className="flex w-20 shrink-0 flex-col items-center gap-2"
+              aria-label={`Start ${name} radio`}
+            >
+              <span className="relative flex h-20 w-20 items-center justify-center overflow-hidden rounded-full border border-border bg-surface-2">
+                {img ? (
+                  <img src={img} alt="" className="h-full w-full object-cover" loading="lazy" />
+                ) : (
+                  <Music2 className="h-7 w-7 text-muted-foreground/60" />
+                )}
+                {loading && (
+                  <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/55">
+                    <Loader2 className="h-5 w-5 animate-spin text-white" />
+                  </span>
+                )}
+              </span>
+              <span className="w-full truncate text-center text-xs font-medium text-foreground/85">{name}</span>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 /** "More to explore" pages: 4 song rows per page, swipe left for the next 4.
  *  Peek layout — pages are 28px narrower than the column with a 12px gap, so a
  *  16px sliver of the next page's art shows at the screen edge (YTM's tell). */
@@ -320,7 +406,9 @@ function QuickPicksDial({ tracks }: { tracks: Track[] }) {
 
 export function HomeScreen() {
   const { playTrack, likedTracks: likedTracksRaw } = usePlayer();
+  const { toast } = useToast();
   const [mood, setMood] = useState("All");
+  const [radioBusy, setRadioBusy] = useState<string | null>(null);
 
   // Hydration safety: anything time-based, random-seeded, or localStorage-derived must
   // render deterministically on the server AND the first client render, then swap after
@@ -471,6 +559,28 @@ export function HomeScreen() {
   const leftOff = useMemo(() => recent.map(histToTrack), [recent]);
   const likedTracks = useMemo(() => (mounted ? likedTracksRaw : []), [mounted, likedTracksRaw]);
 
+  // Artist radio — the Radio shelf's tap handler: seed their most-played song,
+  // context = their own songs, smart radio grows behind it.
+  const startArtistRadio = useCallback(
+    async (name: string) => {
+      if (radioBusy) return;
+      setRadioBusy(name);
+      try {
+        const res = await searchApi(`${name} songs`);
+        const theirs = res.filter((t) => fold(name) && t.artist.split(",").map((a) => fold(a)).some((a) => a === fold(name) || (fold(name).length > 3 && a.includes(fold(name)))));
+        const pool = (theirs.length >= 3 ? theirs : res).filter((t) => t.duration >= 45);
+        if (pool.length === 0) throw new Error("no songs");
+        const sorted = [...pool].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays));
+        playTrack(sorted[0], sorted, `${name} radio`);
+      } catch {
+        toast({ title: `Couldn't start ${name} radio`, description: "Check your connection and try again", duration: 3000 });
+      } finally {
+        setRadioBusy(null);
+      }
+    },
+    [playTrack, radioBusy, toast]
+  );
+
   return (
     <div className="space-y-10 pb-8">
       {/* Mood chips — the feed opens straight into the filter chips, YTM-style */}
@@ -541,6 +651,11 @@ export function HomeScreen() {
         </section>
       )}
       {qp === null && <SkelQuickPicks />}
+
+      {/* Radio — artist profiles; tap → that artist's radio. Radio is a choice,
+          not the app's default behavior — it sits between Quick picks and
+          Listen again (user's exact placement), after the personal shelves. */}
+      <RadioShelf onArtist={(n) => void startArtistRadio(n)} busy={radioBusy} />
 
       {/* Listen again — real history */}
       {leftOff.length > 0 && (

@@ -1,13 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { Heart, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio } from "lucide-react";
+import { Heart, Disc3, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { fmtTime } from "@/lib/data";
 import type { Track } from "@/lib/types";
 import { usePlayer } from "@/lib/player";
 import { useCover } from "@/lib/covers";
 import { useToast } from "@/hooks/use-toast";
+import { canGoToAlbum, openAlbumFor } from "@/lib/goToAlbum";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { AddToPlaylistSheet } from "./PlayerMenus";
 import { Cover, NowBars } from "./Cover";
@@ -141,6 +142,18 @@ export function TrackRow({ track, index, context, showAlbum = true, label, radio
           <DropdownMenuItem onClick={() => setPlOpen(true)} className="gap-2.5">
             <Music className="h-4 w-4 text-muted-foreground" /> Add to playlist
           </DropdownMenuItem>
+          {canGoToAlbum(track) && (
+            <DropdownMenuItem
+              onClick={() => {
+                void openAlbumFor(track).then((ok) => {
+                  if (!ok) toast({ title: "Album not found for this song", duration: 2500 });
+                });
+              }}
+              className="gap-2.5"
+            >
+              <Disc3 className="h-4 w-4 text-muted-foreground" /> Go to album
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
             onClick={() => {
               startRadio(track);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PlayerProvider, usePlayer } from "@/lib/player";
 import { TopBar, Sidebar, BottomNav } from "@/components/Shell";
 import { MiniPlayer, FullPlayer, QueuePanel } from "@/components/Player";
@@ -11,6 +11,8 @@ import { SearchScreen } from "@/components/screens/Search";
 import { ExploreScreen } from "@/components/screens/Explore";
 import { LibraryScreen } from "@/components/screens/Library";
 import { LikedView, UserPlaylistView } from "@/components/screens/PlaylistView";
+import { AlbumView } from "@/components/screens/AlbumView";
+import { OPEN_ALBUM_EVENT } from "@/lib/goToAlbum";
 import type { Screen } from "@/lib/types";
 
 export default function Page() {
@@ -39,6 +41,26 @@ function AppShell() {
     document.getElementById("main-scroll")?.scrollTo({ top: 0 });
   };
 
+  // "Go to album" (from the player menu / song rows — anywhere): the album page
+  // is a real screen now. It remembers where the request came from so Back
+  // returns to THAT screen, not a fixed one.
+  const screenRef = useRef(screen);
+  useEffect(() => {
+    screenRef.current = screen;
+  });
+  const backFromAlbumRef = useRef<Screen>({ name: "home" });
+  useEffect(() => {
+    const onOpenAlbum = (e: Event) => {
+      const id = (e as CustomEvent<string>).detail;
+      if (!id) return;
+      backFromAlbumRef.current = screenRef.current;
+      setScreen({ name: "album", id });
+      document.getElementById("main-scroll")?.scrollTo({ top: 0 });
+    };
+    window.addEventListener(OPEN_ALBUM_EVENT, onOpenAlbum);
+    return () => window.removeEventListener(OPEN_ALBUM_EVENT, onOpenAlbum);
+  }, []);
+
   const searchFor = (q: string) => {
     setSearchSeed({ q, n: Date.now() });
     navigate({ name: "search" });
@@ -65,6 +87,7 @@ function AppShell() {
               )}
               {screen.name === "playlist" &&
                 (screen.id === "liked" ? <LikedView onBack={() => navigate({ name: "library" })} /> : <UserPlaylistView id={screen.id} onBack={() => navigate({ name: "library" })} />)}
+              {screen.name === "album" && <AlbumView id={screen.id} onBack={() => navigate(backFromAlbumRef.current)} />}
             </div>
           </div>
         </main>

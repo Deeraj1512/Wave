@@ -16,9 +16,10 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import { Check, ListMusic, ListPlus, Music, Plus, Timer, X } from "lucide-react";
+import { Check, Disc3, ListMusic, ListPlus, Music, Plus, Timer, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayer, type SleepTimerState } from "@/lib/player";
+import { canGoToAlbum, openAlbumFor } from "@/lib/goToAlbum";
 import { useToast } from "@/hooks/use-toast";
 import {
   addToUserPlaylist,
@@ -292,9 +293,11 @@ export function MoreOptionsSheet({
   onSleepTimer: () => void;
   onQueue: () => void;
 }) {
-  const { sleepTimer, queue, queueIndex } = usePlayer();
+  const { sleepTimer, queue, queueIndex, current } = usePlayer();
+  const { toast } = useToast();
   const upcoming = Math.max(0, queue.length - queueIndex - 1);
   const sleepSub = !sleepTimer ? "Off" : sleepTimer.mode === "track" ? "After the current song" : `${sleepTimer.minutes} min`;
+  const albumOk = current ? canGoToAlbum(current) : false;
   return (
     <AnimatePresence>
       {open && (
@@ -306,6 +309,19 @@ export function MoreOptionsSheet({
               subtitle="Save this song to your playlists"
               onClick={() => { onClose(); onAddToPlaylist(); }}
             />
+            {albumOk && current && (
+              <SheetRow
+                icon={<Disc3 className="h-4.5 w-4.5" />}
+                title="Go to album"
+                subtitle={current.album}
+                onClick={() => {
+                  onClose();
+                  void openAlbumFor(current).then((ok) => {
+                    if (!ok) toast({ title: "Album not found for this song", duration: 2500 });
+                  });
+                }}
+              />
+            )}
             <SheetRow
               icon={<Timer className="h-4.5 w-4.5" />}
               title="Sleep timer"
