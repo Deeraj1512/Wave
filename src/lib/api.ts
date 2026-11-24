@@ -500,20 +500,22 @@ function keyOf(title: string, artist: string): string {
 }
 
 /** Audio proxy URL — server resolves via Echo's client chain (+sibling fallback).
- *  `codec` is the audio-QUALITY boost: opus-capable players request the 160 kbps
- *  opus lane instead of the universal 128 kbps m4a lane. */
+ *  `codec` = what the device can decode; `quality` = the sound-quality mode
+ *  ("high" = max bitrate lane, "saver" = data-friendly lane). */
 export function audioUrlFor(
   id: string,
   title?: string,
   artist?: string,
   duration?: number,
-  codec?: "aac" | "opus"
+  codec?: "aac" | "opus",
+  quality?: "high" | "saver"
 ): string {
   const p = new URLSearchParams();
   if (title) p.set("title", title);
   if (artist) p.set("artist", artist);
   if (duration) p.set("dur", String(Math.round(duration)));
   if (codec) p.set("codec", codec);
+  if (quality) p.set("quality", quality);
   const qs = p.toString();
   return `/api/audio/${id}${qs ? `?${qs}` : ""}`;
 }

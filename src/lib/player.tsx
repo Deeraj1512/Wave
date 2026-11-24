@@ -8,8 +8,7 @@ import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import { rememberHeard, filterFresh, isStaleSession } from "./queueVariety";
 import { familiarSet } from "./taste";
-import { attachBoost } from "./loudness";
-import { setPreferredCodec } from "./yt/resolve";
+import { setPreferredCodec, getPreferredQuality } from "./yt/resolve";
 import { baseTitle, capArtists, relateBlock } from "./queueBlock";
 import * as ytEmbed from "./ytEmbed";
 import {
@@ -461,9 +460,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       a.addEventListener("seeked", () => notifyPlayState(isPlayingRef.current, snap()));
       a.addEventListener("ended", () => notifyPlayState(false));
       audioRef.current = a;
-      // loudness boost (Batch 2): web routes the element through the gain chain;
-      // native probes CORS first and only attaches when it is provably safe
-      void attachBoost(a);
     }
     return audioRef.current;
   }, []);
@@ -942,7 +938,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
               if (directLoadSeqRef.current !== mySeq || engineRef.current !== "direct") return;
               if (again) return armDirect(again.url, onErrDirect);
             } else {
-              armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC), onErrDirect);
+              armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC, getPreferredQuality()), onErrDirect);
               return;
             }
           } catch {
@@ -963,9 +959,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             return;
           }
           if (!IS_NATIVE) {
-            // WEB: the proxy IS the resolve path (CORS forbids the in-process chain)
+            // WEB: the proxy IS the resolve path (CORS forbids the in-process chain).
+            // quality rides along: the sound-quality chip's high/saver choice.
             settled = true;
-            armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC), onErrDirect);
+            armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC, getPreferredQuality()), onErrDirect);
             return;
           }
           const stream = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);

@@ -152,3 +152,64 @@ export function familiarSet(): Set<string> {
   }
   return s;
 }
+
+// ── rule 4: the personal feed — "Made for you" from the picked artists ──────
+
+/**
+ * Round-robin interleave across artist groups: one song from group 0, one from
+ * group 1, … and wrap. Group ORDER is preserved — callers pass groups in
+ * language pick order, so the shelf breathes Telugu → Hindi → Telugu exactly
+ * the way the user ranked their languages, and no single artist hogs it.
+ * Inside each group the caller pre-shuffles (seeded), so every refresh brings
+ * different songs from the same favorite artists.
+ */
+export function roundRobin<T>(groups: T[][], opts: { take?: number } = {}): T[] {
+  const take = opts.take ?? Infinity;
+  const out: T[] = [];
+  const idx = groups.map(() => 0);
+  let added = true;
+  while (added && out.length < take) {
+    added = false;
+    for (let g = 0; g < groups.length && out.length < take; g++) {
+      const i = idx[g];
+      if (i < groups[g].length) {
+        out.push(groups[g][i]);
+        idx[g] = i + 1;
+        added = true;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Ongoing taste: weave familiar-artist songs (profile picks ∪ most-played)
+ * through a shuffled pool — two familiar for every one unfamiliar — so Quick
+ * picks always lead with the artists the user actually chose/plays, while
+ * discoveries keep trickling in. Empty familiar list = pool unchanged.
+ */
+export function familiarWeave<T extends { artist: string }>(fam: T[], rest: T[], take: number): T[] {
+  const out: T[] = [];
+  let fi = 0;
+  let ri = 0;
+  while (out.length < take && (fi < fam.length || ri < rest.length)) {
+    for (let k = 0; k < 2 && fi < fam.length && out.length < take; k++) out.push(fam[fi++]);
+    if (ri < rest.length && out.length < take) out.push(rest[ri++]);
+    if (fi >= fam.length) while (ri < rest.length && out.length < take) out.push(rest[ri++]); // drain when fam runs dry
+  }
+  return out;
+}
+
+/**
+ * Day-seeded spotlight rotation: the featured slice of an artist list shifts
+ * by one slot per day (deterministic — same day = same spotlight, no SSR
+ * mismatch risk when callers seed by date). History-weighted ordering is the
+ * caller's job; this only rotates, so the "Made for you" cast evolves daily
+ * even before any listening happens.
+ */
+export function rotateBy<T>(arr: T[], daySeed: number): T[] {
+  const n = arr.length;
+  if (n <= 1) return arr;
+  const r = ((daySeed % n) + n) % n;
+  return [...arr.slice(r), ...arr.slice(0, r)];
+}

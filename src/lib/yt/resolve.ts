@@ -54,11 +54,12 @@ export function breakerStatus() {
 const cache = new Map<string, CacheEntry>();
 const excluded = new Map<string, Map<string, number>>(); // videoId -> clientName -> until
 
-/** Cache key carries the codec lane so an opus-capable player re-resolves instead
- *  of being served a stale 128k m4a (and vice versa for Safari sessions). */
-const cacheKey = (videoId: string, codec: PreferredCodec) => `${videoId}:${codec}`;
+/** Cache key carries the codec lane + quality mode so a player switching to
+ *  HQ or Saver re-resolves instead of being served the other mode's stream. */
+const cacheKey = (videoId: string, codec: PreferredCodec, quality: PreferredQuality) =>
+  `${videoId}:${codec}:${quality}`;
 
-/** Clear every codec lane for one videoId (403/expiry mid-stream). */
+/** Clear every codec/quality lane for one videoId (403/expiry mid-stream). */
 function invalidateAllCodecs(videoId: string) {
   for (const k of [...cache.keys()]) {
     if (k === videoId || k.startsWith(`${videoId}:`)) cache.delete(k);
@@ -87,14 +88,18 @@ export function getChainDebug() {
   return chainDebug;
 }
 
-// ── codec preference (audio QUALITY boost) ──────────────────────────────────
-// YouTube's best audio-only stream is opus 251 (~160 kbps); the m4a fallback
-// (itag 140) is ~128 kbps. Chromium (Android WebView, Chrome, Edge) plays
-// webm/opus; Safari does not — so the player declares what it supports and
-// this module prefers it. Default stays m4a: universal, never breaks anyone.
+// ── codec + quality preference (the SOUND QUALITY feature) ──────────────────
+// codec = what the device can DECODE (opus on Chromium/WebView, aac on Safari).
+// quality = what the user wants to SPEND: "high" maximizes bitrate (256k AAC
+// when served, else opus 251 ~160k, else 128k m4a); "saver" minimizes it for
+// expensive mobile data. Sound quality is the feature — not volume.
 
 export type PreferredCodec = "aac" | "opus";
+export type PreferredQuality = "high" | "saver";
 let preferredCodec: PreferredCodec = "aac";
+let preferredQuality: PreferredQuality = "high";
+
+const qualityListeners = new Set<() => void>();
 
 export function setPreferredCodec(c: PreferredCodec) {
   preferredCodec = c;
@@ -104,22 +109,60 @@ export function getPreferredCodec(): PreferredCodec {
   return preferredCodec;
 }
 
-/** Pick the best audio format: audio-only, prefer the requested codec, then bitrate. */
-function pickFormat(
+export function setPreferredQuality(q: PreferredQuality) {
+  if (q === preferredQuality) return;
+  preferredQuality = q;
+  try {
+    if (typeof window !== "undefined") localStorage.setItem("dhun.quality", q);
+  } catch {
+    /* private mode — in-memory only */
+  }
+  for (const l of qualityListeners) l();
+}
+
+export function getPreferredQuality(): PreferredQuality {
+  return preferredQuality;
+}
+
+export function subscribeQuality(l: () => void): () => void {
+  qualityListeners.add(l);
+  return () => qualityListeners.delete(l);
+}
+
+// hydrate the persisted choice once per session
+if (typeof window !== "undefined") {
+  try {
+    const saved = localStorage.getItem("dhun.quality");
+    if (saved === "high" || saved === "saver") preferredQuality = saved;
+  } catch {
+    /* fresh install */
+  }
+}
+
+/**
+ * Pick the best audio format for THIS device + quality preference.
+ * First filter to what the player can actually decode (an aac-only player
+ * never receives opus, whatever its bitrate), then score by the quality
+ * preference: "high" maximizes bitrate (fidelity), "saver" minimizes it.
+ */
+export function pickFormat(
   formats: Array<{ itag: number; url?: string; mimeType?: string; bitrate?: number; contentLength?: number; signatureCipher?: string; cipher?: string }>,
-  codec: PreferredCodec = preferredCodec
+  codec: PreferredCodec = preferredCodec,
+  quality: PreferredQuality = preferredQuality
 ) {
-  const usable = formats.filter((f) => typeof f.url === "string" && f.url.startsWith("http") && (f.mimeType ?? "").startsWith("audio/"));
-  if (usable.length === 0) return undefined;
-  const score = (f: (typeof usable)[0]) => {
-    const isM4a = (f.mimeType ?? "").includes("mp4");
-    const isOpus = (f.mimeType ?? "").includes("webm");
-    // preferred codec first (codec-fit dominates bitrate — opus 160k > m4a 128k),
-    // then the higher-bitrate stream wins inside the lane
-    const lane = (codec === "opus" ? isOpus : isM4a) ? 3_000_000 : 0;
-    return lane + (f.bitrate ?? 0);
-  };
-  return usable.sort((a, b) => score(b) - score(a))[0];
+  const playable = formats.filter((f) => {
+    if (typeof f.url !== "string" || !f.url.startsWith("http")) return false;
+    const mime = f.mimeType ?? "";
+    if (!mime.startsWith("audio/")) return false;
+    // decode capability gate: an aac-declaring player must never get webm/opus
+    if (codec === "aac" && mime.includes("webm")) return false;
+    return true;
+  });
+  if (playable.length === 0) return undefined;
+  const bitrate = (f: (typeof playable)[0]) => f.bitrate ?? 0;
+  return quality === "saver"
+    ? [...playable].sort((a, b) => bitrate(a) - bitrate(b))[0]
+    : [...playable].sort((a, b) => bitrate(b) - bitrate(a))[0];
 }
 
 /**
@@ -149,9 +192,10 @@ async function probe(url: string, ua: string, contentLength?: number): Promise<P
 
 export async function resolveStream(
   videoId: string,
-  opts: { allowPreview?: boolean; forceRefresh?: boolean; codec?: PreferredCodec } = {}
+  opts: { allowPreview?: boolean; forceRefresh?: boolean; codec?: PreferredCodec; quality?: PreferredQuality } = {}
 ): Promise<ResolvedStream | null> {
   const codec = opts.codec ?? preferredCodec;
+  const quality = opts.quality ?? preferredQuality;
   // Bootstrap failure (bot wall / offline) is "resolve unavailable", not a crash —
   // callers drop to the sibling fallback / next engine.
   try {
@@ -163,7 +207,7 @@ export async function resolveStream(
   chainDebug = [];
 
   if (!opts.forceRefresh) {
-    const hit = cache.get(cacheKey(videoId, codec));
+    const hit = cache.get(cacheKey(videoId, codec, quality));
     if (hit && hit.expiresAt > Date.now()) {
       chainDebug.push({ client: hit.client, status: "cache-hit" });
       return hit;
@@ -196,7 +240,7 @@ export async function resolveStream(
       }
       continue;
     }
-    const fmt = pickFormat(pr.formats, codec);
+    const fmt = pickFormat(pr.formats, codec, quality);
     if (!fmt?.url) {
       chainDebug.push({ client: c.name, status: "no-plain-url", formats: pr.formats.length });
       continue;
@@ -220,7 +264,7 @@ export async function resolveStream(
       expiresAt: Date.now() + URL_TTL,
       preview: !!c.preview,
     };
-    cache.set(cacheKey(videoId, codec), resolved);
+    cache.set(cacheKey(videoId, codec, quality), resolved);
     return resolved;
   }
   return null;
@@ -319,9 +363,12 @@ async function playerChainProbe(vid: string): Promise<{ ok: boolean; preview: bo
  */
 export async function resolveStreamSmart(
   videoId: string,
-  meta?: { title?: string; artist?: string; durationSec?: number; codec?: PreferredCodec }
+  meta?: { title?: string; artist?: string; durationSec?: number; codec?: PreferredCodec; quality?: PreferredQuality }
 ): Promise<(ResolvedStream & { requestedVideoId: string; viaSibling: boolean }) | null> {
-  const direct = await resolveStream(videoId, meta?.codec ? { codec: meta.codec } : {});
+  const direct = await resolveStream(videoId, {
+    ...(meta?.codec ? { codec: meta.codec } : {}),
+    ...(meta?.quality ? { quality: meta.quality } : {}),
+  });
   if (direct) return { ...direct, requestedVideoId: videoId, viaSibling: false };
 
   if (meta?.title && meta.title !== "Unknown") {
@@ -330,10 +377,11 @@ export async function resolveStreamSmart(
       const r = await resolveStream(sib, {
         allowPreview: siblingPreview.get(videoId) ?? false,
         ...(meta.codec ? { codec: meta.codec } : {}),
+        ...(meta.quality ? { quality: meta.quality } : {}),
       });
       if (r) {
         // serve the sibling's URL under the REQUESTED id (audio proxy keys on requested id)
-        cache.set(cacheKey(videoId, meta.codec ?? preferredCodec), r);
+        cache.set(cacheKey(videoId, meta.codec ?? preferredCodec, meta.quality ?? preferredQuality), r);
         return { ...r, requestedVideoId: videoId, viaSibling: true };
       }
     }
