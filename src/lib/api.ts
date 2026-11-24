@@ -13,7 +13,7 @@
  */
 import type { Track } from "./types";
 import { colorFor } from "./data";
-import { detectTrackLang } from "./langs";
+import { detectTrackLang, inferLiveLang } from "./langs";
 import { recentPlays, topArtists } from "./history";
 
 /** True inside the Capacitor Android/iOS shell (APK), false in any browser. */
@@ -110,7 +110,13 @@ export function apiTrackToTrack(t: ApiTrack): Track {
  * Hindi, which mislabeled every collab as "Tamil".
  */
 function detectLang(t: ApiTrack): Track["lang"] {
-  return detectTrackLang(t);
+  // Romanized live titles ("Veezha Veera", "Butta Bomma") carry no marker and no
+  // native script — detectTrackLang answers undefined for most of the catalog.
+  // inferLiveLang closes that gap with the bundled catalog's own facts: movie /
+  // album names are near-unique per industry, and an artist's catalog profile
+  // says which language they sing in. Explicit markers and native script stay
+  // first (unambiguous); the catalog inference is the fallback, never a guess.
+  return detectTrackLang(t) ?? inferLiveLang({ title: t.title, album: t.album, artist: t.artist });
 }
 
 // ── taste re-ranking (the "results follow MY taste" rule) ───────────────────
@@ -154,20 +160,34 @@ function playsNum(plays: string): number {
 }
 
 /**
- * Re-rank search results — YouTube's feel with the listener's taste:
+ * Languages that count as "Indian" for the language-barrier rule. The user's
+ * standing requirement: a language he never listens to must never float above
+ * Indian songs — English results sink below everything Indian, even when their
+ * query match is technically stronger.
+ */
+const INDIAN_LANGS = new Set(["Hindi", "Tamil", "Telugu", "Punjabi", "Kannada", "Malayalam", "Bengali"]);
+
+/**
+ * Re-rank search results — YouTube's feel with the listener's taste.
+ * THE USER'S RULE, in his own words: "search for the songs the user listens
+ * upon the taste the user listens — those songs should be prioritized. The
+ * user listens to Indian songs, no English — English songs on top should not
+ * happen."
  *
- *   1. query-match bucket   — a perfect match always beats a half-match
- *                             (exact ≫ prefix ≫ phrase ≫ tokens, from rel)
- *   2. LANGUAGE priority    — the languages the user actually listens to
- *                             float up at equal relevance; a language they
- *                             never play sinks; unknown language = neutral
- *   3. MOST-PLAYED on top   — within a bucket, the highest play counts come
- *                             first and the least played sink down the list
- *                             (the user's explicit rule)
- *   4. familiar artists     — the user's own top artists as the final tiebreak
- *
- * Taste NEVER overrides a relevance bucket: the exact song the user typed is
- * always the top of the list; taste decides the order of everything below it.
+ *   1. TYPED MATCH TIER     — the song being typed (exact title ≫ title extends
+ *                             the phrase ≫ phrase inside title, rel ≥ 4500)
+ *                             stays absolutely on top. Typing beats taste.
+ *   2. LANGUAGE BARRIER     — the languages the user ACTUALLY listens to come
+ *                             first, ordered by listening weight; Indian
+ *                             languages he doesn't listen to hold a small
+ *                             floor (still Indian); unknown = neutral middle;
+ *                             a foreign never-listened language (English)
+ *                             sinks below EVERYTHING — never above Indian songs.
+ *   3. query relevance      — within a language group, the better query match
+ *                             wins (YouTube's relevance inside the taste lanes).
+ *   4. familiar artists     — the user's own top artists next.
+ *   5. MOST-PLAYED on top   — play counts decide the tail: most played first,
+ *                             least played at the bottom of the list.
  */
 export function tasteRank(tracks: Track[], rels: number[]): Track[] {
   try {
@@ -180,17 +200,27 @@ export function tasteRank(tracks: Track[], rels: number[]): Track[] {
       let taste = 0;
       if (primary && fam.has(primary)) taste += 3;
       else if (primary && [...fam].some((f) => f.includes(primary) || primary.includes(f))) taste += 1;
-      // language priority: listened languages by play weight · unknown = neutral ·
-      // a language the user never listens to sinks below both
-      const langBoost = t.lang ? (langW.get(t.lang) ?? -1) : 0;
-      return { t, relB: bucket(rels[i] ?? 0), langBoost, views: playsNum(t.plays), taste, i };
+      // Language barrier ladder: listened language by play weight (100-199,
+      // compressed so any listened language beats any non-listened one) ·
+      // Indian-not-listened floor +1 · unknown 0 · foreign -1 (the sink).
+      let langBoost = 0;
+      if (t.lang) {
+        const w = langW.get(t.lang);
+        langBoost = w !== undefined ? 100 + Math.min(99, w) : INDIAN_LANGS.has(t.lang) ? 1 : -1;
+      }
+      const relB = bucket(rels[i] ?? 0);
+      // "The song I'm typing" — exact/prefix/phrase-in-title — must top the
+      // list no matter what; taste orders everything below it.
+      const typed = relB >= 3 ? 1 : 0;
+      return { t, typed, langBoost, relB, views: playsNum(t.plays), taste, i };
     });
     scored.sort(
       (a, b) =>
-        b.relB - a.relB ||
+        b.typed - a.typed ||
         b.langBoost - a.langBoost ||
-        b.views - a.views ||
+        b.relB - a.relB ||
         b.taste - a.taste ||
+        b.views - a.views ||
         a.i - b.i
     );
     return scored.map((x) => x.t);
