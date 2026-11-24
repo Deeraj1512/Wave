@@ -1,24 +1,25 @@
 /**
- * Taste engine — Batch 2's ranking rules, as pure functions (unit-testable).
+ * Taste engine — the feed's ranking rules, as pure functions (unit-testable).
  *
- * The user's standing law, in his own words: songs the user actually listens
- * to must be PRIORITIZED; a language he never listens to must never float
- * above his music — English at the top "should not happen".
+ * The user's standing law, in his own words (v43): "no other language should be
+ * there in feed other than selected language. Suppose I selected Telugu and
+ * Tamil then Hindi songs should not be there in the feed… no Hindi song in feed
+ * unless the language is selected."
  *
- * Three rules every surface obeys:
+ * Three rules every feed surface obeys:
  *
- * 1. TASTE LANGUAGES (rankedTasteLangs) — onboarding picks, in pick order,
- *    merged with real listening weights from history. The profile speaks even
- *    with zero history (fresh install), history sharpens it afterwards.
+ * 1. FEED LANGUAGES (feedLangs) — the languages the user SELECTED at onboarding,
+ *    in pick order. History never ADDS languages to this set (a couple of stray
+ *    plays must not reopen the door the user closed); it only re-ranks the
+ *    picked ones. Without a profile the user's own play history defines the set.
  *
- * 2. PROGRESSIVE LANGUAGE RULE (progressiveMix) — songs OUTSIDE the taste
- *    languages are allowed to trickle in ONE or TWO at a time, evenly spread
- *    through the list, never as a block, never more than the cap. "In the
- *    feed there can be other language songs but 1-2 songs only at a time."
- *    A 18-tile Quick picks grid admits at most 2; a 12-row shelf admits 1;
- *    a long radio admits a proportional few. Undetected-language songs are
- *    treated as in-taste (detection is best-effort; Mix pools are seeded by
- *    the user's own plays).
+ * 2. STRICT LANGUAGE LOCK (strictLangFilter) — songs outside the feed languages
+ *    are DROPPED, never kept as filler, never "1-2 at a time". The old
+ *    progressive-trickle rule is retired. A song whose language cannot be
+ *    detected is dropped too — EXCEPT when the pool itself was fetched under a
+ *    feed language's query (a "sid sriram telugu songs" search), in which case
+ *    the pool's own language may be presumed: the detection ladder
+ *    (langs.trackLangOf) would have flagged ANY contradicting evidence.
  *
  * 3. TASTE ORDER (tasteOrder) — inside the allowed set: taste-language songs
  *    first (ranked by taste rank), then familiar artists promoted, then
@@ -26,21 +27,47 @@
  */
 
 import type { Lang, Track } from "./types";
-import { detectTrackLang } from "./langs";
-import { profileArtists, rankedTasteLangs } from "./profile";
-import { topArtists } from "./history";
+import { detectTrackLang, trackLangOf } from "./langs";
+import { getProfile, profileArtists } from "./profile";
+import { recentPlays, topArtists } from "./history";
 
-// ── rule 1: the ranked taste language list ──────────────────────────────────
+// ── rule 1: the feed's language set (STRICT) ─────────────────────────────────
 
 /**
- * Listening weight per language from play history (already computed by
- * callers in some paths — pass it in to avoid recompute). Each profile pick
- * also carries a floor weight in PICK ORDER, so a fresh install still ranks
- * Telugu-over-Hindi exactly the way the user tapped them.
+ * The languages the feed may serve — SELECTED languages only. Profile picks in
+ * pick order; history only sharpens their ORDER elsewhere, never the set. No
+ * profile: the listener's own plays define taste (a language with ≥2 recent
+ * plays qualifies). Empty (fresh install, nothing played): the feed is not yet
+ * under contract and no filter applies.
+ */
+export function feedLangs(): Lang[] {
+  const p = getProfile();
+  if (p && !p.skipped && p.langs.length > 0) return [...p.langs];
+  try {
+    const counts = new Map<string, number>();
+    for (const e of recentPlays(60)) {
+      const l = (e.lang as Lang | undefined) ?? detectTrackLang({ title: e.title });
+      if (!l) continue;
+      counts.set(l, (counts.get(l) ?? 0) + Math.max(1, e.n ?? 1));
+    }
+    return [...counts.entries()]
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .map(([l]) => l);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Listening weight per language (profile picks carry a pick-order floor; real
+ * play history merges on top) — the ORDERING weights behind rankedTasteLangs.
+ * Note: these weights order the SELECTED languages; they never admit a new
+ * language into the feed (see feedLangs).
  */
 export function tasteLangWeights(historyWeights?: Map<string, number>): Map<string, number> {
   const out = new Map<string, number>();
-  const picks = rankedTasteLangs();
+  const picks = getProfile() && !getProfile()!.skipped ? getProfile()!.langs : [];
   // pick-order floor: #1 gets 5, each later pick 1 less (min 1)
   picks.forEach((l, i) => out.set(l, Math.max(1, 5 - i)));
   if (historyWeights) {
@@ -51,61 +78,40 @@ export function tasteLangWeights(historyWeights?: Map<string, number>): Map<stri
   return out;
 }
 
-// ── rule 2: the progressive language rule ───────────────────────────────────
-
-/** Language of a track — explicit field, markers, native script. */
-function langOf(t: { title: string; album?: string; lang?: Lang }): Lang | undefined {
-  return t.lang ?? detectTrackLang({ title: t.title, album: t.album });
-}
-
-/** Is this track inside the listener's taste languages? */
-export function inTaste(
-  t: { title: string; album?: string; lang?: Lang },
-  taste: Lang[]
-): boolean {
-  const l = langOf(t);
-  if (l === undefined) return true; // undetectable — treated as in-taste (never punished)
-  return taste.includes(l);
-}
+// ── rule 2: the strict language lock ─────────────────────────────────────────
 
 /**
- * Split a pool into taste-body + foreign-trickle, then interleave the trickle
- * evenly. `cap` = hard ceiling on foreign songs (undefined = proportional:
- * ~1 per 8 body tracks, min 1, max 4 — the "1-2 songs at a time" rule).
- * Order within each group is preserved (callers shuffle upstream).
+ * Drop every song outside `langs` — hard. Detection runs the full strict ladder
+ * (explicit field, markers, native script, movie/album fact, romanized title
+ * words, decisive artist profiles). A song with NO detectable language is
+ * dropped too, unless `opts.presumptive` names a feed language that the pool
+ * itself was fetched under ("sid sriram telugu songs" → unknown rows are
+ * presumed Telugu; any row the ladder DOES classify stays bound by the ladder).
+ * Empty `langs` = no contract yet = pool unchanged (cold start).
  */
-export function progressiveMix<T extends { title: string; album?: string; lang?: Lang }>(
+export function strictLangFilter<T extends { title: string; album?: string; artist?: string; lang?: Lang }>(
   pool: T[],
-  taste: Lang[],
-  opts: { cap?: number; rnd?: () => number } = {}
+  langs: Lang[],
+  opts: { presumptive?: Lang } = {}
 ): T[] {
-  if (taste.length === 0) return pool; // no taste signal → the pool speaks for itself
-  const body: T[] = [];
-  const foreign: T[] = [];
-  for (const t of pool) (inTaste(t, taste) ? body : foreign).push(t);
-  if (body.length === 0) {
-    // pool is ALL foreign — allow the proportional few (never zero out the shelf)
-    const cap = opts.cap ?? 2;
-    return foreign.slice(0, cap);
-  }
-  const cap = opts.cap ?? Math.min(4, Math.max(1, Math.round(body.length / 8)));
-  const n = Math.min(foreign.length, cap);
-  if (n === 0) return body;
+  if (langs.length === 0) return pool;
+  const allowed = new Set(langs);
+  return pool.filter((t) => {
+    const l = trackLangOf(t);
+    if (l !== undefined) return allowed.has(l);
+    if (opts.presumptive && allowed.has(opts.presumptive)) return true;
+    return false; // unknown language never enters the feed
+  });
+}
 
-  // even spread: place one foreign track after every ceil(body/n) body tracks,
-  // with an optional seeded jitter so refreshes don't repeat the same slots
-  const out: T[] = [];
-  const stride = body.length / n;
-  let fi = 0;
-  for (let b = 0; b < body.length; b++) {
-    out.push(body[b]);
-    const nextSlot = Math.round((fi + 1) * stride);
-    if (fi < n && b + 1 >= Math.floor(nextSlot) && b + 1 < body.length) {
-      out.push(foreign[fi++]);
-    }
-  }
-  while (fi < n) out.push(foreign[fi++]); // safety (stride rounding can strand the tail)
-  return out;
+/** In-taste check kept for callers that classify a single track (tests, chips). */
+export function inTaste(
+  t: { title: string; album?: string; artist?: string; lang?: Lang },
+  langs: Lang[]
+): boolean {
+  const l = trackLangOf(t);
+  if (l === undefined) return false; // strict: unknown counts as outside
+  return langs.includes(l);
 }
 
 // ── rule 3: taste order for shelves ─────────────────────────────────────────
@@ -128,7 +134,7 @@ export function tasteOrder<T extends { title: string; album?: string; artist: st
     return Math.round(parseFloat(m[1]) * mult);
   };
   const score = (t: T): number[] => {
-    const l = langOf(t);
+    const l = trackLangOf(t);
     const lr = l !== undefined ? (langRank.has(l) ? langRank.get(l)! : (l === "English" ? 90 : 80)) : 20; // unknown ≈ neutral
     const famHit = fam.has(t.artist.split(",")[0].trim().toLowerCase()) ? 0 : 1;
     return [lr, famHit, -playsNum(t.plays)];
@@ -158,7 +164,7 @@ export function familiarSet(): Set<string> {
 /**
  * Round-robin interleave across artist groups: one song from group 0, one from
  * group 1, … and wrap. Group ORDER is preserved — callers pass groups in
- * language pick order, so the shelf breathes Telugu → Hindi → Telugu exactly
+ * language pick order, so the shelf breathes Telugu → Tamil → Telugu exactly
  * the way the user ranked their languages, and no single artist hogs it.
  * Inside each group the caller pre-shuffles (seeded), so every refresh brings
  * different songs from the same favorite artists.

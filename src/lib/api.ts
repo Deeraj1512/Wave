@@ -13,7 +13,7 @@
  */
 import type { Track } from "./types";
 import { colorFor } from "./data";
-import { detectTrackLang, inferLiveLang } from "./langs";
+import { detectTrackLang, inferLiveLang, guessLangFromWords } from "./langs";
 import { recentPlays, topArtists } from "./history";
 import { rankedTasteLangs } from "./profile";
 
@@ -106,18 +106,16 @@ export function apiTrackToTrack(t: ApiTrack): Track {
 /**
  * Language is only shown when we KNOW it. Live YTM results carry no language field,
  * so we trust explicit "(Hindi)"/"(Telugu)"-style markers in the title/album plus
- * native-script titles (Telugu/Tamil/… Unicode blocks) and stay silent otherwise.
- * Artist-name guessing is forbidden: Anirudh composes across Tamil, Telugu and
- * Hindi, which mislabeled every collab as "Tamil".
+ * native-script titles (Telugu/Tamil/… Unicode blocks), then movie/album names from
+ * the live catalog (near-unique per industry). Artist-dominant inference is
+ * FORBIDDEN here: a multilingual artist's dominant language (Sid Sriram → Telugu)
+ * is a prior about the artist, not evidence about a single song — stamping it on
+ * every track once leaked his Hindi songs into a Telugu-only feed as "Telugu".
+ * The strict feed ladder (langs.trackLangOf) applies artist evidence only when
+ * decisive, and only as the last resort.
  */
 function detectLang(t: ApiTrack): Track["lang"] {
-  // Romanized live titles ("Veezha Veera", "Butta Bomma") carry no marker and no
-  // native script — detectTrackLang answers undefined for most of the catalog.
-  // inferLiveLang closes that gap with the bundled catalog's own facts: movie /
-  // album names are near-unique per industry, and an artist's catalog profile
-  // says which language they sing in. Explicit markers and native script stay
-  // first (unambiguous); the catalog inference is the fallback, never a guess.
-  return detectTrackLang(t) ?? inferLiveLang({ title: t.title, album: t.album, artist: t.artist });
+  return detectTrackLang(t) ?? inferLiveLang({ title: t.title, album: t.album, artist: t.artist }, undefined, { noArtist: true }) ?? guessLangFromWords(`${t.title} ${t.album}`);
 }
 
 // ── taste re-ranking (the "results follow MY taste" rule) ───────────────────

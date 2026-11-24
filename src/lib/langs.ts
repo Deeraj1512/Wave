@@ -1,14 +1,21 @@
 /**
  * Language detection for live YouTube results — the glue behind the queue's
- * language chips (YTM's "Tamil / Telugu" autoplay filters).
+ * language chips (YTM's "Tamil / Telugu" autoplay filters) AND the strict feed
+ * filter (trackLangOf).
  *
- * Two signals, in order of trust:
+ * Signals, in order of trust:
  *  1. Explicit markers in title/album — "(Telugu)", "[Hindi]", "From the Telugu movie …"
  *  2. Unicode script of title/album text — Telugu block → Telugu, Devanagari → Hindi, …
+ *  3. Movie/album names from the live catalog — near-unique per industry (data, no guessing)
+ *  4. Romanized song-title WORDS — "Kesariya"/"pyaar" are Hindi, "bomma"/"manasu" are
+ *     Telugu, "kadhal"/"thozha" are Tamil (see the classifier below)
+ *  5. Artist catalog profiles — only when the artist sings exactly ONE catalog language
+ *     (or dominates by a 4× margin); multilingual artists (Sid Sriram sings Telugu,
+ *     Tamil, Hindi…) prove nothing about a single song
  *
- * Artist-name guessing stays forbidden (Anirudh composes across Tamil, Telugu and
- * Hindi — it mislabeled every collab), but script detection of SONG TEXT is safe:
- * native-script titles are unambiguous.
+ * Artist-name guessing stays forbidden as the FIRST signal (Anirudh composes across
+ * Tamil, Telugu and Hindi — it mislabeled every collab), but script detection of
+ * SONG TEXT is safe: native-script titles are unambiguous.
  */
 import type { Lang } from "./types";
 import { catalogNow } from "./catalog";
@@ -38,6 +45,94 @@ export function detectTrackLang(t: { title?: string; album?: string; lang?: Lang
   }
   for (const { re, lang } of SCRIPTS) if (re.test(s)) return lang;
   return undefined;
+}
+
+// ── Romanized-title WORD classifier (per-song evidence for the strict feed) ──
+// YouTube titles are usually romanized ("Kesariya", "Butta Bomma") — no marker,
+// no native script. Artist profiles can't separate a multilingual artist's
+// songs (Sid Sriram sings Telugu, Tamil AND Hindi), but song TITLE words can:
+// Hindi/Urdu romanization and the Dravidian languages have near-disjoint
+// vocabularies. High-precision lists ONLY — a false Hindi label drops a real
+// Telugu song (shelf thins), a false Telugu label leaks a Hindi song into the
+// feed (the exact bug the user reported). Words that appear in 2+ languages'
+// songs live in AMBIGUOUS and are never evidence.
+const WORDS: Partial<Record<Lang, string[]>> = {
+  Hindi: [
+    "dil", "dilbar", "pyaar", "pyar", "ishq", "mohabbat", "sanam", "jaan", "janam",
+    "dard", "khuda", "rab", "yaad", "zindagi", "tere", "tera", "teri", "mera", "meri",
+    "mere", "apna", "apni", "aashiq", "aashiqui", "saathiya", "sajna", "ranjha",
+    "heeriye", "kesariya", "sawan", "barsaat", "aankhein", "naino", "chand", "chanda",
+    "sitara", "badal", "phir", "kyun", "hain", "tum", "hum", "yaar", "zaalima",
+    "bewafa", "wafa", "adhoora", "adhoori", "duniya", "manzil", "banjaara", "khoya",
+    "kaise", "kaisa", "kaisi", "kitna", "kitni", "jab", "naam", "humdum", "bewajah",
+    // note: "tere/tera/teri" are shared with Punjabi romanization — tolerated,
+    // Hindi and Punjabi both sit on the same side of the Dravidian barrier
+  ],
+  Telugu: [
+    "nuvvu", "nenu", "kannulu", "cheliya", "chelli", "bomma", "bujji",
+    "ammai", "abbayi", "hrudayam", "kalalu", "raave", "raava", "kaavaale", "vayasa",
+    "samudram", "priyathama", "priyatama", "oohalu", "maate", "vennela", "vennello",
+    "devuda", "telusu", "telusa", "telupu", "andham", "andhaala", "mogudu",
+    "gundello", "antava", "vachinde", "pilla", "chinuku", "navvu", "kadile",
+  ],
+  Tamil: [
+    "naan", "kadhal", "kadhale", "kannamma", "vaanam", "unnai", "enna", "ennavo",
+    "uyire", "uyir", "kanave", "kanaa", "vizhi", "mazhai", "megham", "thamizh",
+    "tamizh", "penn", "paarvai", "solla", "solli", "vendum", "naanum", "thozha",
+    "thozhi", "anbe", "anbu", "vaathi", "pillai", "kanmani", "chellame",
+  ],
+  Punjabi: [
+    "kudi", "kude", "raataan", "raatan", "chann", "jatt", "jatti", "suit",
+    "patiala", "mainu", "tenu", "sadda", "munda", "gabru", "chitti", "punjabi",
+  ],
+  Kannada: [
+    "neenu", "kanasu", "nagu", "nagutha", "naguthe", "yeno", "yaako",
+    "hennu", "baaro",
+  ],
+  Malayalam: [
+    "njan", "njaan", "snehame", "mizhi", "mizhikal", "thooval", "priye",
+    "venmegham", "nin",
+  ],
+  Bengali: [
+    "tumi", "tomar", "bhalo", "bhalobashi", "bhalobasha", "keno", "mon", "hashi",
+    "chokh", "dukho", "amar",
+  ],
+};
+
+/** Words shared across languages' romanized songs — never evidence. */
+const AMBIGUOUS = new Set([
+  "nee", "naa", "kanne", "chinni", "chinna", "rendu", "mahi", "mahive", "ponnu",
+  "kannil", "manasu", "prema", "premalo", "pranaya", "naanu", "kanu", "raja",
+  "kallu",
+]);
+
+/**
+ * Language guessed from ROMANIZED song-title words only. Requires the winner to
+ * beat every other language (a tie — one Hindi word + one Telugu word — proves
+ * nothing and answers undefined). English is deliberately absent: Latin-script
+ * songs with no Indian word hits fall through to the rest of the ladder, and a
+ * strict feed then drops them (exactly right for an Indian-language listener).
+ */
+export function guessLangFromWords(text: string): Lang | undefined {
+  const s = (text ?? "").toLowerCase();
+  if (!/[a-z]/.test(s)) return undefined;
+  const tokens = new Set(s.split(/[^a-z]+/).filter((w) => w.length >= 3 && !AMBIGUOUS.has(w)));
+  if (tokens.size === 0) return undefined;
+  let best: Lang | undefined;
+  let bestHits = 0;
+  let tie = false;
+  for (const [lang, list] of Object.entries(WORDS) as Array<[Lang, string[]]>) {
+    let hits = 0;
+    for (const w of list) if (tokens.has(w)) hits++;
+    if (hits > bestHits) {
+      bestHits = hits;
+      best = lang;
+      tie = false;
+    } else if (hits > 0 && hits === bestHits) {
+      tie = true;
+    }
+  }
+  return tie ? undefined : bestHits > 0 ? best : undefined;
 }
 
 // ── Catalog-backed inference for romanized live results ──────────────────────
@@ -95,14 +190,21 @@ function dominantOf(m: Map<Lang, number>): Lang {
  * Infer a language for a live (romanized) track using the live catalog. `seedLang`
  * biases the artist profile: an artist known to sing in the seed's language counts
  * as in-language; an artist who NEVER sings it is flagged as foreign (drift marker).
+ * `opts.noArtist` skips the artist-profile leg entirely — used by api.ts when
+ * stamping the Track.lang FIELD: a multilingual artist's dominant language is a
+ * prior about the ARTIST, not evidence about THIS song (Sid Sriram's dominant
+ * Telugu must never brand his Hindi songs "Telugu"). The strict feed ladder
+ * (trackLangOf) applies the artist leg only as the last resort.
  */
 export function inferLiveLang(
   t: { title: string; album?: string; artist: string },
   seedLang?: Lang,
+  opts: { noArtist?: boolean } = {},
 ): Lang | undefined {
   ensureIndexes();
   const alb = norm(t.album ?? "");
   if (alb && movieLangIdx!.has(alb)) return movieLangIdx!.get(alb);
+  if (opts.noArtist) return undefined;
 
   const profiles = t.artist
     .split(",")
@@ -113,6 +215,42 @@ export function inferLiveLang(
   const anySeed = profiles.some((m) => m.has(seedLang));
   if (anySeed) return seedLang; // in-language credit — matches YTM's language-stationary mixes
   return dominantOf(profiles[0]); // foreign-only artist → their language (drift marker for relateBlock)
+}
+
+// ── The STRICT ladder (trackLangOf) — per-song language, no leakage ──────────
+// The feed's strict filter needs the best per-song answer, in evidence order:
+// explicit field → marker → native script → movie/album fact → title words →
+// artist profile ONLY when it is decisive (exactly one catalog language, or a
+// 4× dominant margin with ≥4 catalog songs). Undefined = genuinely unknown —
+// the strict filter then decides (drop, unless the pool's own source language
+// may be presumed).
+export function trackLangOf(
+  t: { title?: string; album?: string; artist?: string; lang?: Lang },
+): Lang | undefined {
+  if (t.lang) return t.lang; // frozen at play time / catalog anchoring — a fact
+  const direct = detectTrackLang({ title: t.title, album: t.album });
+  if (direct) return direct;
+
+  ensureIndexes();
+  const alb = norm(t.album ?? "");
+  if (alb && movieLangIdx!.has(alb)) return movieLangIdx!.get(alb);
+
+  const words = guessLangFromWords(`${t.title ?? ""} ${t.album ?? ""}`);
+  if (words) return words;
+
+  const profiles = (t.artist ?? "")
+    .split(",")
+    .map((a) => artistLangIdx!.get(norm(a)))
+    .filter((m): m is Map<Lang, number> => !!m);
+  const first = profiles[0];
+  if (first) {
+    if (first.size === 1) return [...first.keys()][0]; // artist sings ONE language
+    const sorted = [...first.entries()].sort((a, b) => b[1] - a[1]);
+    const [l1, c1] = sorted[0];
+    const c2 = sorted[1]?.[1] ?? 0;
+    if (c1 >= 4 && c1 >= 4 * c2) return l1; // decisive dominance only
+  }
+  return undefined;
 }
 
 /** The language a party/familiar query should lean on — current track first, then queue. */

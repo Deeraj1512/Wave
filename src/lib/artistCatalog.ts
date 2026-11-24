@@ -19,8 +19,8 @@
 import { artistPhotoApi, searchApi } from "./api";
 import { catalogTracks } from "./catalog";
 import { topArtists } from "./history";
-import { profileArtists } from "./profile";
-import type { Track } from "./types";
+import { getProfile, profileArtists } from "./profile";
+import type { Lang, Track } from "./types";
 
 /** Diacritic-strip + lowercase + whitespace collapse — the artist matching key. */
 export function fold(s: string): string {
@@ -126,7 +126,10 @@ export function isArtistTrack(track: Track, artistName: string): boolean {
 /**
  * The Radio shelf's artist list — up to `limit` names. Your onboarding picks
  * lead, then your listening history, curated defaults fill the rest so the
- * shelf is never half-empty.
+ * shelf is never half-empty. With a saved profile the curated defaults are
+ * CONSTRAINED to the selected languages: a Telugu listener's feed never
+ * offers a Hindi artist's circle (the strict language lock covers artists,
+ * not just songs).
  */
 export function radioArtists(limit = 10): string[] {
   const out: string[] = [];
@@ -137,7 +140,10 @@ export function radioArtists(limit = 10): string[] {
     seen.add(k);
     out.push(name);
   };
+  let langs: Lang[] | null = null;
   try {
+    const p = getProfile();
+    if (p && !p.skipped && p.langs.length > 0) langs = p.langs;
     // onboarding favorites first — the user TOLD us these matter
     for (const a of profileArtists()) {
       if (out.length >= limit) break;
@@ -152,6 +158,7 @@ export function radioArtists(limit = 10): string[] {
   }
   for (const d of DEFAULT_RADIO_ARTISTS) {
     if (out.length >= limit) break;
+    if (langs && !langs.includes(d.lang as Lang)) continue; // the lock covers artists too
     push(d.name);
   }
   return out;
