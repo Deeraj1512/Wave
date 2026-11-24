@@ -15,6 +15,7 @@ import type { Track } from "./types";
 import { colorFor } from "./data";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import { recentPlays, topArtists } from "./history";
+import { rankedTasteLangs } from "./profile";
 
 /** True inside the Capacitor Android/iOS shell (APK), false in any browser. */
 export const IS_NATIVE: boolean =
@@ -131,9 +132,12 @@ function foldName(s: string): string {
 
 /**
  * The listener's language profile — how many plays went to each language
- * (recent history, play-count weighted). This is "the priority he listens
- * which type of language": a user who lives in Telugu gets Telugu results
- * ranked above the rest, at EQUAL query relevance.
+ * (recent history, play-count weighted), PLUS the onboarding profile's picks
+ * with a pick-order floor. This is "the priority he listens which type of
+ * language": a user who lives in Telugu gets Telugu results ranked above the
+ * rest, at EQUAL query relevance — and a fresh install with a profile (say,
+ * Telugu picked first, English never) is already fully taste-ranked from its
+ * very first search.
  */
 function tasteLangWeights(): Map<string, number> {
   const counts = new Map<string, number>();
@@ -146,7 +150,17 @@ function tasteLangWeights(): Map<string, number> {
       counts.set(l, (counts.get(l) ?? 0) + Math.max(1, p.n ?? 1));
     }
   } catch {
-    /* fresh install — no taste profile yet */
+    /* fresh install — the profile floor below still applies */
+  }
+  // profile picks: #1 carries the strongest floor, later picks slightly less
+  // (min 1) — enough to outrank any un-listened language, never enough to beat
+  // a genuinely dominating listening phase of another chosen language
+  try {
+    rankedTasteLangs(counts).forEach((l, i) => {
+      counts.set(l, Math.max(counts.get(l) ?? 0, Math.max(1, 6 - i)));
+    });
+  } catch {
+    /* no profile yet */
   }
   return counts;
 }
@@ -485,14 +499,62 @@ function keyOf(title: string, artist: string): string {
   return `${title.toLowerCase().trim()}|${artist.split(",")[0].toLowerCase().trim()}`;
 }
 
-/** Audio proxy URL — server resolves via Echo's client chain (+sibling fallback). */
-export function audioUrlFor(id: string, title?: string, artist?: string, duration?: number): string {
+/** Audio proxy URL — server resolves via Echo's client chain (+sibling fallback).
+ *  `codec` is the audio-QUALITY boost: opus-capable players request the 160 kbps
+ *  opus lane instead of the universal 128 kbps m4a lane. */
+export function audioUrlFor(
+  id: string,
+  title?: string,
+  artist?: string,
+  duration?: number,
+  codec?: "aac" | "opus"
+): string {
   const p = new URLSearchParams();
   if (title) p.set("title", title);
   if (artist) p.set("artist", artist);
   if (duration) p.set("dur", String(Math.round(duration)));
+  if (codec) p.set("codec", codec);
   const qs = p.toString();
   return `/api/audio/${id}${qs ? `?${qs}` : ""}`;
+}
+
+/**
+ * Does THIS browser play webm/opus? Chromium (Android WebView, Chrome, Edge)
+ * does — those sessions get the 160 kbps opus lane. Safari answers "" and
+ * keeps the universal m4a lane.
+ */
+export function browserSupportsOpus(): boolean {
+  if (typeof document === "undefined") return false;
+  try {
+    const a = document.createElement("audio");
+    return !!a.canPlayType && a.canPlayType('audio/webm; codecs="opus"') !== "";
+  } catch {
+    return false;
+  }
+}
+
+// ── Artist photo (the FACE, not the song art) ────────────────────────────────
+
+/**
+ * Real artist portrait (Radio shelf circles, onboarding grid, Artist page).
+ * WEB: the browser cannot call music.youtube.com in-process (no CORS), so the
+ * resolution runs on our server through /api/artist-img. NATIVE (APK):
+ * CapacitorHttp patches fetch → no CORS → the identical chain runs in-process.
+ * Result: the artist's face wherever their music is sold/streamed — verified
+ * live ("Arijit Singh" → his concert portrait, not the Raees poster).
+ */
+export async function artistPhotoApi(name: string): Promise<string | undefined> {
+  if (!name?.trim()) return undefined;
+  if (IS_NATIVE) {
+    const { artistPhoto } = await import("./yt/artistPhoto");
+    return artistPhoto(name).catch(() => undefined);
+  }
+  // THROWS on transport failure (5xx / offline) so the caller knows the attempt
+  // was transient and must not cache a fallback; undefined = clean "no face".
+  const res = await fetch(`/api/artist-img?name=${encodeURIComponent(name.trim())}`);
+  if (!res.ok) throw new Error(`artist-img ${res.status}`);
+  const data = (await res.json()) as { url?: string | null };
+  return data.url ?? undefined;
 }
 
 // ── Native audio (APK) — the Echo chain runs on-device ───────────────────────

@@ -2,11 +2,14 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
-import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio } from "./api";
+import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio, browserSupportsOpus } from "./api";
 import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, getNativePlaybackState } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import { rememberHeard, filterFresh, isStaleSession } from "./queueVariety";
+import { familiarSet } from "./taste";
+import { attachBoost } from "./loudness";
+import { setPreferredCodec } from "./yt/resolve";
 import { baseTitle, capArtists, relateBlock } from "./queueBlock";
 import * as ytEmbed from "./ytEmbed";
 import {
@@ -219,13 +222,15 @@ export function balancedShuffle<T extends { artist: string }>(tracks: T[]): T[] 
 
 /**
  * Taste boost — the queue must match the LISTENER, not only the song: up to 3
- * tracks by the user's own top artists (history.topArtists) are pulled to the
- * front of the block. One new artist heard once sprinkles 1-2 songs; repeated
- * listening promotes them — feed-follows-behavior, nothing forced.
+ * tracks by the user's own artists are pulled to the front of the block.
+ * "Their artists" = onboarding favorites (profile) ∪ history top artists, so a
+ * brand-new account's picks already shape its queues from the very first play.
+ * One new artist heard once sprinkles 1-2 songs; repeated listening promotes
+ * them — feed-follows-behavior, nothing forced.
  */
 function familiarBoost(pool: Track[]): Track[] {
   try {
-    const fam = new Set(topArtists(10).map(primaryArtist));
+    const fam = familiarSet();
     if (fam.size === 0) return pool;
     const head: Track[] = [];
     const tail: Track[] = [];
@@ -423,9 +428,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   // resolve chunk, so the first play never pays the dynamic-module load cost.
   // (The old /api/stream-health probe is gone: the server no longer mints URLs —
   // the CLIENT does — so a bot-gated deployment IP must not steer the engine choice.)
+  // Also: declare the audio-QUALITY lane once — opus 160 kbps wherever the player
+  // can decode it (Android WebView / Chrome / Edge), universal m4a otherwise.
+  const AUDIO_CODEC: "aac" | "opus" = IS_NATIVE ? "opus" : browserSupportsOpus() ? "opus" : "aac";
   useEffect(() => {
     ytEmbed.prewarmApi();
-    void import("./yt/resolve").catch(() => {});
+    void import("./yt/resolve").then((m) => m.setPreferredCodec(AUDIO_CODEC)).catch(() => {});
   }, []);
 
   const setEngineBoth = useCallback((m: Engine) => {
@@ -453,6 +461,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       a.addEventListener("seeked", () => notifyPlayState(isPlayingRef.current, snap()));
       a.addEventListener("ended", () => notifyPlayState(false));
       audioRef.current = a;
+      // loudness boost (Batch 2): web routes the element through the gain chain;
+      // native probes CORS first and only attaches when it is provably safe
+      void attachBoost(a);
     }
     return audioRef.current;
   }, []);
@@ -931,7 +942,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
               if (directLoadSeqRef.current !== mySeq || engineRef.current !== "direct") return;
               if (again) return armDirect(again.url, onErrDirect);
             } else {
-              armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration), onErrDirect);
+              armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC), onErrDirect);
               return;
             }
           } catch {
@@ -954,7 +965,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (!IS_NATIVE) {
             // WEB: the proxy IS the resolve path (CORS forbids the in-process chain)
             settled = true;
-            armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration), onErrDirect);
+            armDirect(audioUrlFor(track.id, track.title, track.artist, track.duration, AUDIO_CODEC), onErrDirect);
             return;
           }
           const stream = await resolveNativeAudio(track.id, track.title, track.artist, track.duration);

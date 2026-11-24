@@ -47,8 +47,12 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ videoId: st
   const artist = req.nextUrl.searchParams.get("artist") ?? undefined;
   const durRaw = req.nextUrl.searchParams.get("dur");
   const durationSec = durRaw ? Number(durRaw) : undefined;
+  // audio QUALITY boost: opus-capable players request the 160 kbps opus lane;
+  // everyone else gets the universal 128 kbps m4a lane (Echo's default)
+  const codecParam = req.nextUrl.searchParams.get("codec");
+  const codec = codecParam === "opus" ? "opus" : codecParam === "aac" ? "aac" : undefined;
 
-  let resolved = await resolveStreamSmart(videoId, { title, artist, durationSec });
+  let resolved = await resolveStreamSmart(videoId, { title, artist, durationSec, ...(codec ? { codec } : {}) });
   if (!resolved) {
     return NextResponse.json({ error: "no stream available", gated: true }, { status: 502 });
   }
@@ -58,7 +62,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ videoId: st
   // 403 → URL may have expired or client refused; invalidate + re-resolve once, then retry.
   if (upstream.status === 403 || upstream.status === 410) {
     invalidateStream(videoId);
-    const retry = await resolveStreamSmart(videoId, { title, artist, durationSec });
+    const retry = await resolveStreamSmart(videoId, { title, artist, durationSec, ...(codec ? { codec } : {}) });
     if (!retry) return NextResponse.json({ error: "re-resolve failed" }, { status: 502 });
     resolved = retry;
     upstream = await pipe(retry, range);

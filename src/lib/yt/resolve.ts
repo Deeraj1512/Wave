@@ -53,6 +53,17 @@ export function breakerStatus() {
 
 const cache = new Map<string, CacheEntry>();
 const excluded = new Map<string, Map<string, number>>(); // videoId -> clientName -> until
+
+/** Cache key carries the codec lane so an opus-capable player re-resolves instead
+ *  of being served a stale 128k m4a (and vice versa for Safari sessions). */
+const cacheKey = (videoId: string, codec: PreferredCodec) => `${videoId}:${codec}`;
+
+/** Clear every codec lane for one videoId (403/expiry mid-stream). */
+function invalidateAllCodecs(videoId: string) {
+  for (const k of [...cache.keys()]) {
+    if (k === videoId || k.startsWith(`${videoId}:`)) cache.delete(k);
+  }
+}
 let chainDebug: Array<{ client: string; status: string; reason?: string; formats?: number; probed?: ProbeInfo }> = [];
 
 function isExcluded(videoId: string, clientName: string): boolean {
@@ -76,15 +87,37 @@ export function getChainDebug() {
   return chainDebug;
 }
 
-/** Pick the best audio format: audio-only, prefer m4a (universal browser support), then bitrate. */
-function pickFormat(formats: Array<{ itag: number; url?: string; mimeType?: string; bitrate?: number; contentLength?: number; signatureCipher?: string; cipher?: string }>) {
+// ── codec preference (audio QUALITY boost) ──────────────────────────────────
+// YouTube's best audio-only stream is opus 251 (~160 kbps); the m4a fallback
+// (itag 140) is ~128 kbps. Chromium (Android WebView, Chrome, Edge) plays
+// webm/opus; Safari does not — so the player declares what it supports and
+// this module prefers it. Default stays m4a: universal, never breaks anyone.
+
+export type PreferredCodec = "aac" | "opus";
+let preferredCodec: PreferredCodec = "aac";
+
+export function setPreferredCodec(c: PreferredCodec) {
+  preferredCodec = c;
+}
+
+export function getPreferredCodec(): PreferredCodec {
+  return preferredCodec;
+}
+
+/** Pick the best audio format: audio-only, prefer the requested codec, then bitrate. */
+function pickFormat(
+  formats: Array<{ itag: number; url?: string; mimeType?: string; bitrate?: number; contentLength?: number; signatureCipher?: string; cipher?: string }>,
+  codec: PreferredCodec = preferredCodec
+) {
   const usable = formats.filter((f) => typeof f.url === "string" && f.url.startsWith("http") && (f.mimeType ?? "").startsWith("audio/"));
   if (usable.length === 0) return undefined;
   const score = (f: (typeof usable)[0]) => {
     const isM4a = (f.mimeType ?? "").includes("mp4");
     const isOpus = (f.mimeType ?? "").includes("webm");
-    // m4a itag 140 (~128kbps) plays everywhere; opus 251 slightly better quality but Safari can't
-    return (isM4a ? 2_000_000 : 0) + (isOpus ? 1_000_000 : 0) + (f.bitrate ?? 0);
+    // preferred codec first (codec-fit dominates bitrate — opus 160k > m4a 128k),
+    // then the higher-bitrate stream wins inside the lane
+    const lane = (codec === "opus" ? isOpus : isM4a) ? 3_000_000 : 0;
+    return lane + (f.bitrate ?? 0);
   };
   return usable.sort((a, b) => score(b) - score(a))[0];
 }
@@ -114,7 +147,11 @@ async function probe(url: string, ua: string, contentLength?: number): Promise<P
   }
 }
 
-export async function resolveStream(videoId: string, opts: { allowPreview?: boolean; forceRefresh?: boolean } = {}): Promise<ResolvedStream | null> {
+export async function resolveStream(
+  videoId: string,
+  opts: { allowPreview?: boolean; forceRefresh?: boolean; codec?: PreferredCodec } = {}
+): Promise<ResolvedStream | null> {
+  const codec = opts.codec ?? preferredCodec;
   // Bootstrap failure (bot wall / offline) is "resolve unavailable", not a crash —
   // callers drop to the sibling fallback / next engine.
   try {
@@ -126,7 +163,7 @@ export async function resolveStream(videoId: string, opts: { allowPreview?: bool
   chainDebug = [];
 
   if (!opts.forceRefresh) {
-    const hit = cache.get(videoId);
+    const hit = cache.get(cacheKey(videoId, codec));
     if (hit && hit.expiresAt > Date.now()) {
       chainDebug.push({ client: hit.client, status: "cache-hit" });
       return hit;
@@ -159,7 +196,7 @@ export async function resolveStream(videoId: string, opts: { allowPreview?: bool
       }
       continue;
     }
-    const fmt = pickFormat(pr.formats);
+    const fmt = pickFormat(pr.formats, codec);
     if (!fmt?.url) {
       chainDebug.push({ client: c.name, status: "no-plain-url", formats: pr.formats.length });
       continue;
@@ -183,7 +220,7 @@ export async function resolveStream(videoId: string, opts: { allowPreview?: bool
       expiresAt: Date.now() + URL_TTL,
       preview: !!c.preview,
     };
-    cache.set(videoId, resolved);
+    cache.set(cacheKey(videoId, codec), resolved);
     return resolved;
   }
   return null;
@@ -191,7 +228,7 @@ export async function resolveStream(videoId: string, opts: { allowPreview?: bool
 
 /** Called by the audio proxy when googlevideo 403s mid-stream. */
 export function invalidateStream(videoId: string, clientName?: string) {
-  cache.delete(videoId);
+  invalidateAllCodecs(videoId);
   if (clientName) excludeClient(videoId, clientName);
 }
 
@@ -282,18 +319,21 @@ async function playerChainProbe(vid: string): Promise<{ ok: boolean; preview: bo
  */
 export async function resolveStreamSmart(
   videoId: string,
-  meta?: { title?: string; artist?: string; durationSec?: number }
+  meta?: { title?: string; artist?: string; durationSec?: number; codec?: PreferredCodec }
 ): Promise<(ResolvedStream & { requestedVideoId: string; viaSibling: boolean }) | null> {
-  const direct = await resolveStream(videoId, {});
+  const direct = await resolveStream(videoId, meta?.codec ? { codec: meta.codec } : {});
   if (direct) return { ...direct, requestedVideoId: videoId, viaSibling: false };
 
   if (meta?.title && meta.title !== "Unknown") {
     const sib = await findPlayableSibling(videoId, meta.title, meta.artist ?? "", meta.durationSec);
     if (sib) {
-      const r = await resolveStream(sib, { allowPreview: siblingPreview.get(videoId) ?? false });
+      const r = await resolveStream(sib, {
+        allowPreview: siblingPreview.get(videoId) ?? false,
+        ...(meta.codec ? { codec: meta.codec } : {}),
+      });
       if (r) {
         // serve the sibling's URL under the REQUESTED id (audio proxy keys on requested id)
-        cache.set(videoId, r);
+        cache.set(cacheKey(videoId, meta.codec ?? preferredCodec), r);
         return { ...r, requestedVideoId: videoId, viaSibling: true };
       }
     }

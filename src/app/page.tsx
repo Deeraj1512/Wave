@@ -14,6 +14,7 @@ import { ExploreScreen } from "@/components/screens/Explore";
 import { LibraryScreen } from "@/components/screens/Library";
 import { LikedView, UserPlaylistView } from "@/components/screens/PlaylistView";
 import { AlbumView } from "@/components/screens/AlbumView";
+import { Onboarding, useOnboardingGate } from "@/components/Onboarding";
 import { OPEN_ALBUM_EVENT } from "@/lib/goToAlbum";
 import type { Screen } from "@/lib/types";
 
@@ -133,8 +134,13 @@ function AppShell() {
     navigate({ name: "search" });
   };
 
+  // ── onboarding (batch 2): first run → the taste flow; Library → "Your taste"
+  //    re-opens it prefilled via the wave:open-profile event ──
+  const [onboardingOpen, setOnboardingOpen] = useOnboardingGate();
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-[var(--bg)] text-foreground">
+      {onboardingOpen && <Onboarding onDone={() => setOnboardingOpen(false)} />}
       <TopBar screen={screen} navigate={navigate} />
 
       <div className="flex min-h-0 flex-1">
