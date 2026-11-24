@@ -2,9 +2,10 @@
 
 /**
  * Home feed — two sources only: YOUR data (history, likes) and the live server.
- * Layout is a verbatim YouTube Music home: chips → More to explore (paged 4-row
- * lists, swipe left for the next 4) → Quick picks (3×3 Speed dial matrix) →
+ * Layout: chips → More to explore (paged 4-row lists, swipe left for the next 4)
+ * → Quick picks (3×3 Speed dial matrix) → Made for you (onboarding artists) →
  * Radio (artist profiles) → Listen again → Mixed for you → Trending → Liked songs.
+ * No greeting header — the feed itself is the hello (user's call).
  *  - Quick picks = your replays + your personal-radio pool (seeded from your most
  *    played song, so the mix stays in YOUR musical universe) + a couple of outside
  *    discoveries — re-mixed on every page load. The songs change on every refresh;
@@ -24,11 +25,11 @@ import { usePlayer } from "@/lib/player";
 import { useToast } from "@/hooks/use-toast";
 import { colorFor, MOOD_CHIPS } from "@/lib/data";
 import { searchApi, radioApi } from "@/lib/api";
-import { recentPlays, radioSeed, subscribeHistory, historyVersion, seededRandom, seededShuffle, type RecentPlay } from "@/lib/history";
-import { radioArtists, artistImage, fold } from "@/lib/artistCatalog";
+import { recentPlays, radioSeed, topArtists, subscribeHistory, historyVersion, seededRandom, seededShuffle, type RecentPlay } from "@/lib/history";
+import { radioArtists, artistImage, fold, isArtistTrack } from "@/lib/artistCatalog";
 import { catalogTracks } from "@/lib/catalog";
 import { getProfile, profileVersion, rankedTasteLangs, subscribeProfile } from "@/lib/profile";
-import { progressiveMix } from "@/lib/taste";
+import { strictLangFilter, feedLangs, roundRobin, familiarWeave, familiarSet, rotateBy } from "@/lib/taste";
 import type { Track, Lang } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -52,6 +53,7 @@ const MOOD_QUERY: Record<string, string> = {
 // ── Per-tab memory of the last rendered sets → a refresh never repeats them. ──
 const QP_LAST = "wave.qp.last";
 const FRESH_LAST = "wave.fresh.last";
+const FORYOU_LAST = "wave.foryou.last";
 
 function lastIds(key: string): Set<string> {
   if (typeof window === "undefined") return new Set();
@@ -70,7 +72,8 @@ function saveIds(key: string, tracks: Track[]) {
   }
 }
 
-/** History entry → playable Track (duration/plays unknown; cards don't show them). */
+/** History entry → playable Track (duration/plays unknown; cards don't show them).
+ *  The language frozen at play time rides along — the strict feed lock reads it. */
 function histToTrack(h: RecentPlay): Track {
   return {
     id: h.id,
@@ -78,6 +81,7 @@ function histToTrack(h: RecentPlay): Track {
     artist: h.artist,
     album: "",
     duration: 0,
+    lang: h.lang as Track["lang"],
     year: 0,
     plays: "",
     colors: colorFor(h.id),
@@ -465,8 +469,9 @@ export function HomeScreen() {
   // Taste languages — snapshotted once per mount (like seedInfo) so mid-session
   // plays never re-roll the mood mixes under the user's eyes. undefined = still
   // resolving, null = no signal at all (cold start, no profile either).
-  // PROFILE FIRST: onboarding picks in pick order, then history weights —
-  // rankedTasteLangs merges both; progressiveMix enforces the 1-2-foreign cap.
+  // PROFILE FIRST: onboarding picks in pick order, then history weights. This
+  // list drives ORDERING only (mood-query prefix) — the feed's
+  // hard language lock reads feedLangs() (SELECTED languages only, below).
   const [tasteLangs, setTasteLangs] = useState<Lang[] | undefined>(undefined);
   useEffect(() => {
     if (!mounted || tasteLangs !== undefined) return;
@@ -474,44 +479,157 @@ export function HomeScreen() {
   }, [mounted, discPool, tasteLangs]);
   const tasteLang = tasteLangs === undefined ? undefined : (tasteLangs[0] ?? null);
 
+  // The feed's STRICT language set: the languages the user SELECTED at
+  // onboarding, in pick order (no profile → their own play history defines
+  // it). History never adds languages here — a couple of stray plays must not
+  // reopen a door the user closed. Every shelf below filters through it.
+  const feedL = useMemo(() => (mounted ? feedLangs() : ([] as Lang[])), [mounted, profV, histV]);
+  // The discovery catalog, already locked to the feed languages — every shelf
+  // that draws discovery rows reads this slice, never the raw catalog.
+  const discStrict = useMemo(() => (discPool ? strictLangFilter(discPool, feedL) : null), [discPool, feedL]);
+
   // "Radio for you" — the personal radio shelf (hidden while loading / when empty).
+  // The personal radio queue is a YouTube mix — multilingual by nature — so the
+  // strict lock keeps "Mixed for you" inside the SELECTED languages, hard.
   const because = useMemo(() => {
     if (!seedInfo || !radioPool || radioPool.length === 0) return null;
-    return { label: seedInfo.title, tracks: radioPool.slice(0, 12) };
-  }, [seedInfo, radioPool]);
+    const locked = strictLangFilter(radioPool, feedL);
+    if (locked.length === 0) return null;
+    return { label: seedInfo.title, tracks: locked.slice(0, 12) };
+  }, [seedInfo, radioPool, feedL]);
+
+  // ── Made for you: the onboarding promise, kept. Songs BY the picked favorite
+  //    artists, in the picked languages, in pick order — round-robined across
+  //    artists (no hogging), re-rolled per refresh, spotlight rotating daily,
+  //    and history-weighted so artists you've actually played lead the cast.
+  //    Sits just below Quick picks (user's exact placement). ──
+  const [forYou, setForYou] = useState<Track[] | null>(null);
+  useEffect(() => {
+    if (!mounted) return;
+    const p = getProfile();
+    if (!p || p.skipped || p.artists.length === 0) {
+      setForYou([]); // no picks → shelf honestly absent, defaults take over
+      return;
+    }
+    let alive = true;
+    setForYou(null); // skeleton while the artist searches run
+    (async () => {
+      try {
+        // cast: onboarding picks — each WITH the language it was picked under —
+        // history-played artists bubbled up, day-rotated
+        const played = new Set(topArtists(12).map((a) => a.trim().toLowerCase()));
+        const cast = rotateBy(
+          p.artists
+            .map((a, i) => ({ name: a.name, lang: a.lang, w: (played.has(a.name.split(",")[0].trim().toLowerCase()) ? 2 : 0) + 1 / (i + 1) }))
+            .sort((a, b) => b.w - a.w),
+          Math.floor(Date.now() / 864e5)
+        ).slice(0, 8);
+
+        // fetch each featured artist's songs BIASED to the language they were
+        // picked under ("sid sriram telugu songs"), then the STRICT language
+        // lock keeps only ladder-PROVEN songs — a favorite's other-language
+        // songs (Sid Sriram's Hindi behind a Telugu pick) never enter the feed.
+        // NO presumption here: multilingual artists are the #1 leak shape, and
+        // measured on live data the proven pools still hold 12-29 tracks each
+        // (perArtist needs 7-16), so proven-only costs nothing.
+        // per-artist headroom scales down as the cast grows, so a 1-artist
+        // profile still fills the 7-page shelf (user wants 6-7 pages per
+        // category, not 2-3).
+        const perArtist = cast.length <= 2 ? 16 : 7;
+        const built: Array<{ lang: Lang; group: Track[]; ci: number }> = [];
+        for (let ci = 0; ci < cast.length; ci++) {
+          const c = cast[ci];
+          if (!alive) return;
+          try {
+            let res = await searchApi(`${c.name} ${c.lang} songs`);
+            let theirs = strictLangFilter(
+              res.filter((t) => t.duration >= 45 && isArtistTrack(t, c.name)),
+              p.langs
+            );
+            if (theirs.length < 3) {
+              // biased query came back thin — plain retry, same strict door
+              const plain = await searchApi(`${c.name} songs`).catch(() => [] as Track[]);
+              const strict2 = strictLangFilter(
+                plain.filter((t) => t.duration >= 45 && isArtistTrack(t, c.name)),
+                p.langs
+              );
+              if (strict2.length > theirs.length) theirs = strict2;
+            }
+            const pool = [...theirs].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays)).slice(0, perArtist);
+            if (pool.length > 0) built.push({ lang: c.lang, group: pool, ci });
+          } catch {
+            /* one shy artist must not sink the shelf */
+          }
+        }
+        if (!alive) return;
+
+        // groups in LANGUAGE PICK ORDER, then artist weight — the shelf
+        // breathes Telugu → Tamil → Telugu exactly the way the user ranked
+        const langRank = new Map(p.langs.map((l, i) => [l, i]));
+        built.sort((a, b) => (langRank.get(a.lang) ?? 99) - (langRank.get(b.lang) ?? 99) || a.ci - b.ci);
+        const groups = built.map((b) => seededShuffle(b.group, rnd));
+
+        const pool = roundRobin(groups, { take: 40 });
+        // FINAL strict pass — bias + presumption already held at every pool,
+        // this pass GUARANTEES it (defense in depth: the user's law is that no
+        // unselected language ever reaches the feed, for any reason).
+        const locked = strictLangFilter(pool, p.langs);
+        const last = lastIds(FORYOU_LAST);
+        let picks = locked.filter((t) => !last.has(t.id));
+        if (picks.length < 16) picks = locked; // thin pool → a repeat beats an empty shelf
+        picks = picks.slice(0, 28); // 7 swipe pages × 4 rows (user's ask)
+        if (alive && picks.length > 0) {
+          saveIds(FORYOU_LAST, picks);
+          setForYou(picks);
+        } else if (alive) setForYou([]);
+      } catch {
+        if (alive) setForYou([]);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [mounted, profV, rnd]);
 
   // ── Quick picks: replays + personal radio + a few discoveries, re-mixed per
-  //    refresh; the previous refresh's exact set is excluded. ─────────────────
+  //    refresh; the previous refresh's exact set is excluded. Every pool is
+  //    locked to the SELECTED languages BEFORE mixing — the old "1-2 foreign
+  //    at a time" trickle is retired: no Hindi behind a Telugu pick, ever. ──
   const [qp, setQp] = useState<Track[] | null>(null);
   useEffect(() => {
-    if (!discPool || !radioPool) return; // pools still loading → skeleton
-    const replays = uniq(recentPlays(24).map(histToTrack)).slice(0, 6);
+    if (!discStrict || !radioPool) return; // pools still loading → skeleton
+    const replays = strictLangFilter(uniq(recentPlays(24).map(histToTrack)), feedL).slice(0, 12);
     const takenIds = new Set(replays.map((t) => t.id));
-    const radioTracks = uniq(radioPool.filter((t) => !takenIds.has(t.id))).slice(0, 14);
+    const radioTracks = strictLangFilter(uniq(radioPool.filter((t) => !takenIds.has(t.id))), feedL).slice(0, 24);
     for (const t of radioTracks) takenIds.add(t.id);
 
-    // Anchored mix: mostly yours + 3 outside discoveries. Cold start (no history):
-    // a pure discovery blend sampled song-by-song across the whole catalog.
-    const extraPool = discPool.filter((t) => !takenIds.has(t.id));
+    // Anchored mix: mostly yours + 10 outside discoveries (already locked —
+    // discovery draws from the strict catalog slice). Cold start (no history):
+    // a discovery blend sampled song-by-song across the locked catalog.
+    const extraPool = discStrict.filter((t) => !takenIds.has(t.id));
     const source =
       replays.length > 0 || radioTracks.length > 0
-        ? [...replays, ...radioTracks, ...seededShuffle(extraPool, rnd).slice(0, 3)]
+        ? [...replays, ...radioTracks, ...seededShuffle(extraPool, rnd).slice(0, 10)]
         : extraPool;
 
     const last = lastIds(QP_LAST);
     let mix = seededShuffle(uniq(source), rnd).filter((t) => !last.has(t.id));
-    if (mix.length < 18) mix = seededShuffle(uniq([...mix, ...discPool]), rnd).slice(0, 18);
-    // the progressive language rule: outside-taste songs trickle in 1-2 at a time,
-    // evenly spread — never a block, never dominating the dial
-    const picks = progressiveMix(mix.slice(0, 18), tasteLangs ?? [], { rnd }); // two full 3×3 speed-dial pages
+    if (mix.length < 63) mix = seededShuffle(uniq([...mix, ...extraPool]), rnd).slice(0, 63);
+    // ongoing taste: the artists you picked / play most lead the dial — two
+    // familiar songs for every outside discovery, still re-shuffled per refresh
+    const fam = familiarSet();
+    const isFam = (t: Track) => fam.has(t.artist.split(",")[0].trim().toLowerCase());
+    const picks = familiarWeave(mix.filter(isFam), mix.filter((t) => !isFam(t)), 63); // seven full 3×3 speed-dial pages (user's ask: 6-7 pages per category)
     saveIds(QP_LAST, picks);
     setQp(picks);
-  }, [discPool, radioPool, rnd, tasteLangs]);
+  }, [discStrict, radioPool, rnd, feedL]);
 
   // ── Fresh picks: another re-roll, disjoint from Quick picks AND its own last set.
   //    Mood chips steer it as mood intent + YOUR language (from play history) —
-  //    never a hard-coded language. Falls back to the plain mood query only if
-  //    the language-prefixed one comes back empty. ──
+  //    never a hard-coded language. The STRICT lock runs on every path: the
+  //    language-prefixed mood query presumes its own language for undetectable
+  //    rows; the plain fallback query does not. Falls back to the plain mood
+  //    query only if the language-prefixed one comes back empty. ──
   const [fresh, setFresh] = useState<Track[] | null>(null);
   useEffect(() => {
     if (mood !== "All") {
@@ -523,9 +641,12 @@ export function HomeScreen() {
       (async () => {
         try {
           let ts = await searchApi(q);
-          if (ts.length === 0 && q !== base) ts = await searchApi(base).catch(() => []);
-          // mood mixes obey the same progressive language rule as the rest of the feed
-          if (alive) setFresh(progressiveMix(ts, tasteLangs ?? [], { cap: 2, rnd }).slice(0, 10));
+          ts = strictLangFilter(ts, feedL, { presumptive: tasteLang ?? undefined });
+          if (ts.length < 24 && q !== base) {
+            const plain = await searchApi(base).catch(() => [] as Track[]);
+            ts = [...ts, ...strictLangFilter(plain, feedL)]; // no presumption on the unprefixed query
+          }
+          if (alive) setFresh(seededShuffle(uniq(ts), rnd).slice(0, 28)); // 7 swipe pages × 4 rows
         } catch {
           if (alive) setFresh([]);
         }
@@ -534,49 +655,85 @@ export function HomeScreen() {
         alive = false;
       };
     }
-    if (!discPool || !radioPool || tasteLangs === undefined) return;
+    if (!discStrict || !radioPool) return;
     const exclude = new Set([...lastIds(QP_LAST), ...lastIds(FRESH_LAST)]);
-    const radioPart = seededShuffle(uniq(radioPool).filter((t) => !exclude.has(t.id)), rnd);
+    const radioPart = seededShuffle(uniq(strictLangFilter(radioPool, feedL)).filter((t) => !exclude.has(t.id)), rnd);
     const radioIds = new Set(radioPart.map((t) => t.id));
-    const discPart = seededShuffle(discPool.filter((t) => !exclude.has(t.id) && !radioIds.has(t.id)), rnd);
-    let mix = seededShuffle(uniq(radioPool.length > 0 ? [...radioPart.slice(0, 6), ...discPart.slice(0, 4)] : discPart), rnd);
-    if (mix.length < 12) {
+    const discPart = seededShuffle(discStrict.filter((t) => !exclude.has(t.id) && !radioIds.has(t.id)), rnd);
+    let mix = seededShuffle(uniq(radioPart.length > 0 ? [...radioPart.slice(0, 10), ...discPart.slice(0, 18)] : discPart), rnd);
+    if (mix.length < 28) {
       const ids = new Set(mix.map((t) => t.id));
-      mix = [...mix, ...seededShuffle(discPool.filter((t) => !ids.has(t.id)), rnd)];
+      mix = [...mix, ...seededShuffle(discStrict.filter((t) => !ids.has(t.id)), rnd)];
     }
-    // progressive language rule at the last step so ANY pool feeding this shelf obeys it
-    const picks = progressiveMix(mix.slice(0, 12), tasteLangs, { rnd }); // three full 4-row explore pages
+    const picks = mix.slice(0, 28); // 7 swipe pages × 4 rows (user's ask); every pool already passed the strict lock
     saveIds(FRESH_LAST, picks);
     setFresh(picks);
-  }, [mood, tasteLang, tasteLangs, discPool, radioPool, rnd]);
+  }, [mood, tasteLang, feedL, discStrict, radioPool, rnd]);
 
-  // ── Trending (live chart — no editorial fallback: hidden until it arrives) ──
+  // ── Trending — one live chart per SELECTED language, merged in pick order.
+  //    The national "trending songs india" chart is a Hindi wall; a Telugu
+  //    listener's trending shelf must be THEIR charts. Rows fetched under a
+  //    language's own query may presume it for undetectable titles; rows the
+  //    ladder detects as another language are dropped, hard. ──
   const [trending, setTrending] = useState<Track[] | null>(null);
   useEffect(() => {
     let alive = true;
-    searchApi("trending songs india")
-      .then((ts) => alive && setTrending(ts.slice(0, 10)))
-      .catch(() => {});
+    (async () => {
+      try {
+        if (feedL.length > 0) {
+          const top = feedL.slice(0, 3);
+          const per = await Promise.allSettled(top.map((l) => searchApi(`${l.toLowerCase()} trending songs`)));
+          const seen = new Set<string>();
+          const merged: Track[] = [];
+          for (let i = 0; i < top.length; i++) {
+            const r = per[i];
+            if (r.status !== "fulfilled") continue;
+            for (const t of strictLangFilter(r.value, feedL, { presumptive: top[i] })) {
+              if (seen.has(t.id)) continue;
+              seen.add(t.id);
+              merged.push(t);
+            }
+          }
+          if (alive) setTrending(merged.slice(0, 10));
+        } else {
+          const ts = await searchApi("trending songs india");
+          if (alive) setTrending(strictLangFilter(ts, feedL).slice(0, 10));
+        }
+      } catch {
+        /* no editorial fallback: hidden until a fetch lands */
+      }
+    })();
     return () => {
       alive = false;
     };
-  }, []);
+  }, [feedL]);
 
   const leftOff = useMemo(() => recent.map(histToTrack), [recent]);
   const likedTracks = useMemo(() => (mounted ? likedTracksRaw : []), [mounted, likedTracksRaw]);
 
   // Artist radio — the Radio shelf's tap handler: seed their most-played song,
-  // context = their own songs, smart radio grows behind it.
+  // context = their own songs, smart radio grows behind it. The tap is
+  // deliberate, but the language law still holds: the search is biased to the
+  // language the artist was picked under, and the pool passes the STRICT lock
+  // (undetectable rows presume that language; detected other languages drop).
   const startArtistRadio = useCallback(
     async (name: string) => {
       if (radioBusy) return;
       setRadioBusy(name);
       try {
-        const res = await searchApi(`${name} songs`);
+        const p = getProfile();
+        const hasProfile = !!p && !p.skipped && p.langs.length > 0;
+        const langs = hasProfile ? p!.langs : [];
+        const pickLang = hasProfile ? p!.artists.find((a) => fold(a.name) === fold(name))?.lang : undefined;
+        const res = await searchApi(pickLang ? `${name} ${pickLang} songs` : `${name} songs`);
         const theirs = res.filter((t) => fold(name) && t.artist.split(",").map((a) => fold(a)).some((a) => a === fold(name) || (fold(name).length > 3 && a.includes(fold(name)))));
         const pool = (theirs.length >= 3 ? theirs : res).filter((t) => t.duration >= 45);
-        if (pool.length === 0) throw new Error("no songs");
-        const sorted = [...pool].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays));
+        // STRICT, no presumption — the radio seed must be a ladder-proven song
+        // in a selected language, so the language-locked queue that grows
+        // behind it anchors in the right language
+        const locked = strictLangFilter(pool, langs);
+        if (locked.length === 0) throw new Error("no songs"); // honest error beats a foreign radio
+        const sorted = [...locked].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays));
         playTrack(sorted[0], sorted, `${name} radio`);
       } catch {
         toast({ title: `Couldn't start ${name} radio`, description: "Check your connection and try again", duration: 3000 });
@@ -589,14 +746,6 @@ export function HomeScreen() {
 
   return (
     <div className="space-y-10 pb-8">
-      {/* profile greeting — the "login" shows up as a personal hello (batch 2) */}
-      {mounted && profile && !profile.skipped && profile.name !== "Listener" && (
-        <p className="px-1 pt-1 text-sm text-muted-foreground" aria-live="polite">
-          Good to see you, <span className="font-semibold text-foreground">{profile.name}</span>
-          {tasteLang ? <span> · your {tasteLang} feed</span> : null}
-        </p>
-      )}
-
       {/* Mood chips — the feed opens straight into the filter chips, YTM-style */}
       <div className="no-scrollbar -mx-1 flex gap-2 overflow-x-auto px-1 pt-2">
         {MOOD_CHIPS.map((m) => (
@@ -666,9 +815,33 @@ export function HomeScreen() {
       )}
       {qp === null && <SkelQuickPicks />}
 
+      {/* Made for you — the onboarding-picks shelf, placed just BELOW Quick
+          picks (user's exact placement): their songs, their languages, in pick
+          order. Hidden when the user skipped onboarding or the artist
+          searches came back empty. */}
+      {mounted && profile && !profile.skipped && forYou !== null && forYou.length > 0 && (
+        <section aria-label="Made for you">
+          <div className="mb-4 flex items-center justify-between px-1">
+            <div>
+              <h2 className="text-xl font-medium text-foreground sm:text-[22px]">Made for {profile.name}</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {profile.langs.slice(0, 2).join(" · ")} mix · your favorite artists
+              </p>
+            </div>
+            <button
+              onClick={() => forYou[0] && playTrack(forYou[0], forYou, "Made for you")}
+              className="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium text-foreground/90 transition hover:bg-surface-2"
+            >
+              <Play className="h-4 w-4" /> Play all
+            </button>
+          </div>
+          <ExplorePages tracks={forYou} label="Made for you" />
+        </section>
+      )}
+
       {/* Radio — artist profiles; tap → that artist's radio. Radio is a choice,
-          not the app's default behavior — it sits between Quick picks and
-          Listen again (user's exact placement), after the personal shelves. */}
+          not the app's default behavior — it sits after the personal shelves
+          (Quick picks, Made for you), before Listen again. */}
       <RadioShelf onArtist={(n) => void startArtistRadio(n)} busy={radioBusy} />
 
       {/* Listen again — real history */}

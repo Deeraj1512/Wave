@@ -3,12 +3,12 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnimatePresence, animate, motion, Reorder, useDragControls, useMotionValue, useTransform } from "framer-motion";
 import {
-  ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Trash2, Volume2, VolumeX, X,
+  AudioLines, ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Trash2, Volume2, VolumeX, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayer, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
 import { IS_NATIVE } from "@/lib/api";
-import { BOOST_GAINS, boostLabel, getBoostLevel, setBoostLevel, subscribeBoost } from "@/lib/loudness";
+import { getPreferredQuality, setPreferredQuality, subscribeQuality, type PreferredQuality } from "@/lib/yt/resolve";
 import { registerBackHandler } from "@/lib/backStack";
 import { useCover } from "@/lib/covers";
 import { fmtTime } from "@/lib/data";
@@ -180,31 +180,32 @@ function SeekArea({
 // now-playing view, queue button lights when songs are manually queued.
 // ─────────────────────────────────────────────────────────────────────────────
 /**
- * Loudness boost chip (Batch 2 — the "too low on phone/laptop" fix). Cycles
- * Off → +30% → +60% → +100%. WEB routes the audio element through a Web Audio
- * gain chain (real amplification); the APK raises the system MEDIA volume via
- * WaveAudio.raiseMediaVolume (googlevideo has no CORS, so Web Audio would mute
- * it) — either way the label shows the active boost.
+ * Sound-quality chip (the fidelity control — NOT a volume boost). Toggles
+ * between HQ (the highest-bitrate stream this device can decode: 256 kbps AAC
+ * when YouTube serves it, else opus ~160 kbps, else 128 kbps m4a) and Data
+ * saver (~48-50 kbps for expensive mobile data). Applies to the next track
+ * that resolves; the current song keeps playing untouched. Persisted.
  */
-function BoostChip({ className }: { className?: string }) {
-  const level = useSyncExternalStore(subscribeBoost, getBoostLevel, () => 0);
+function QualityChip({ className }: { className?: string }) {
+  const quality = useSyncExternalStore(subscribeQuality, getPreferredQuality, () => "high" as PreferredQuality);
+  const high = quality === "high";
   return (
     <button
-      onClick={() => setBoostLevel((level + 1) % BOOST_GAINS.length)}
-      aria-label={`Loudness boost: ${boostLabel()}`}
+      onClick={() => setPreferredQuality(high ? "saver" : "high")}
+      aria-label={`Sound quality: ${high ? "high" : "data saver"}`}
       title={
-        IS_NATIVE
-          ? "Loudness boost — raises the media volume to max (tap to cycle, Off restores)"
-          : "Loudness boost — +30% / +60% / +100% amplification (tap to cycle)"
+        high
+          ? "Sound quality: HIGH — the best stream this device can decode (256k AAC when served, else opus ~160k). Tap for data saver."
+          : "Sound quality: DATA SAVER — smallest usable stream (~48-50k) to go easy on mobile data. Tap for high quality."
       }
       className={cn(
         "flex h-9 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-bold transition",
-        level > 0 ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/10 hover:text-white",
+        high ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/10 hover:text-white",
         className
       )}
     >
-      {level > 0 ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
-      <span className="tabular-nums">{level === 0 ? "Boost" : boostLabel()}</span>
+      <AudioLines className="h-4 w-4" />
+      <span className="tabular-nums">{high ? "HQ" : "Saver"}</span>
     </button>
   );
 }
@@ -408,7 +409,7 @@ export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQue
               aria-label="Volume"
               style={{ background: `linear-gradient(to right, #f5f3ef ${volume * 100}%, rgba(255,255,255,0.2) ${volume * 100}%)` }}
             />
-            <BoostChip />
+            <QualityChip />
             <button
               onClick={onToggleQueuePanel}
               aria-label={queuePanelOpen ? "Close queue panel" : "Open queue panel"}
@@ -784,7 +785,7 @@ export function FullPlayer() {
                 </button>
               </div>
               <div className="flex items-center gap-2">
-                <BoostChip />
+                <QualityChip />
                 <button onClick={cycleRepeat} aria-label={repeat === 2 ? "Loop one" : repeat === 1 ? "Loop all" : "Loop off"} aria-pressed={repeat !== 0} title={`Loop: ${repeat === 2 ? "one song" : repeat === 1 ? "all" : "off"}`} className={cn("flex h-10 w-10 items-center justify-center rounded-full transition", repeat !== 0 ? "text-white" : "text-white/50 hover:text-white")}>
                   {repeat === 2 ? <Repeat1 className="h-5 w-5" /> : <Repeat className="h-5 w-5" />}
                 </button>
