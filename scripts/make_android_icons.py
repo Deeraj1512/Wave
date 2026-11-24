@@ -33,11 +33,36 @@ S = img.size[0]
 # where plain luminance would eat the dark-red note head/stem.
 a = np.asarray(img).astype(np.float32)
 maxc = a[..., :3].max(axis=2)
-# smooth ramp: ≤80 → transparent, ≥120 → opaque
+minc = a[..., :3].min(axis=2)
+sat = maxc - minc
+# base ramp: ≤80 → transparent, ≥120 → opaque (note + bright arc bodies)
 alpha = np.clip((maxc - 80.0) / (120.0 - 80.0), 0.0, 1.0)
+# ARC-RESCUE (v2): the OUTER gray arc fades to maxc ≈ 90-120, which the base
+# ramp renders mostly transparent — on the phone the launcher then shows only
+# ONE arc (user bug report). The outer arc is NEUTRAL gray (sat < 22) while
+# the card's dim pixels are dark-maroon/red-dominant or darker still, so a
+# neutral-gated low ramp recovers the outer arc WITHOUT letting the card in.
+neutral_gate = (sat < 22.0) * np.clip((maxc - 50.0) / 25.0, 0.0, 1.0)
+alpha = np.maximum(alpha, neutral_gate)
 art = a.copy()
 art[..., 3] = alpha * 255.0
+# ARC-RESCUE (v2b): lift dim artwork brightness (gamma < 1 on the max channel,
+# RGB scaled proportionally so hue/saturation relationships survive) — the
+# outer arc's ~90-105 body lands near the inner arc's ~135-165, so BOTH arcs
+# stay clearly visible at launcher sizes (48-120 px) instead of melting into
+# the near-black background layer.
+lift = 255.0 * np.power(np.maximum(maxc, 1.0) / 255.0, 0.72)
+scale = np.where(maxc > 0, lift / np.maximum(maxc, 1.0), 1.0)[..., None]
+art[..., :3] = np.clip(art[..., :3] * scale, 0, 255)
 art_img = Image.fromarray(art.astype(np.uint8), "RGBA")
+
+# Legacy card variant: the design card with the SAME lifted artwork recolored
+# in place (card background untouched) — legacy launchers show two arcs too.
+card_lifted = img.copy()
+m = alpha > 0.02
+cl = np.asarray(card_lifted).astype(np.float32)
+cl[m] = art[m]
+card_lifted = Image.fromarray(cl.astype(np.uint8), "RGBA")
 # crop to the artwork's bounding box so centering is exact
 bbox = art_img.getbbox()
 art_img = art_img.crop(bbox)
@@ -83,13 +108,14 @@ for name, scale in DENSITIES.items():
     legacy = int(round(48 * scale))          # 48dp launcher
     round_px = int(round(legacy))
 
-    # legacy: the card icon as-is (its own rounded corners + transparency)
-    put(os.path.join(d, "ic_launcher.png"), img.resize((legacy, legacy), Image.LANCZOS))
+    # legacy: the lifted card icon (its own rounded corners + transparency) —
+    # artwork recolored brighter so BOTH arcs survive launcher sizes
+    put(os.path.join(d, "ic_launcher.png"), card_lifted.resize((legacy, legacy), Image.LANCZOS))
 
-    # legacy round: circle mask over the full card
+    # legacy round: circle mask over the lifted card
     r = Image.new("L", (S, S), 0)
     ImageDraw.Draw(r).ellipse([0, 0, S, S], fill=255)
-    rounded = img.copy()
+    rounded = card_lifted.copy()
     rounded.putalpha(r)
     put(os.path.join(d, "ic_launcher_round.png"), rounded.resize((round_px, round_px), Image.LANCZOS))
 
