@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.os.Build;
 import androidx.core.app.ActivityCompat;
 import com.getcapacitor.JSObject;
@@ -126,6 +127,55 @@ public class WaveAudioPlugin extends Plugin {
         state.put("running", MediaPlaybackService.running);
         state.put("playing", MediaPlaybackService.playingNow);
         call.resolve(state);
+    }
+
+    /**
+     * Loudness boost (Batch 2) — the honest native lever. The WebView's audio
+     * element caps at 1.0 and googlevideo streams carry no CORS headers, so a
+     * Web Audio gain chain is off-limits in the APK (it would output silence);
+     * the real phone-side boost is the system MEDIA volume itself.
+     *   mediaVolume()    → {current, max} for the UI slider state
+     *   raiseMediaVolume → moves STREAM_MUSIC by `steps` (negative lowers it),
+     *                      clamped to [0, max], without popping the system HUD
+     */
+    @PluginMethod
+    public void mediaVolume(PluginCall call) {
+        try {
+            AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                JSObject out = new JSObject();
+                out.put("current", am.getStreamVolume(AudioManager.STREAM_MUSIC));
+                out.put("max", am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+                call.resolve(out);
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void raiseMediaVolume(PluginCall call) {
+        Integer stepsObj = call.getInt("steps");
+        int steps = stepsObj != null ? stepsObj : 1;
+        try {
+            AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                int cur = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                int next = Math.max(0, Math.min(max, cur + steps));
+                if (next != cur) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, next, 0); // flags=0 → no HUD pop
+                }
+                JSObject out = new JSObject();
+                out.put("current", next);
+                out.put("max", max);
+                call.resolve(out);
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        call.resolve();
     }
 
     private static String orEmpty(String s) {
