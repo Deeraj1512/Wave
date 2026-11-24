@@ -27,6 +27,8 @@ import { searchApi, radioApi } from "@/lib/api";
 import { recentPlays, radioSeed, subscribeHistory, historyVersion, seededRandom, seededShuffle, type RecentPlay } from "@/lib/history";
 import { radioArtists, artistImage, fold } from "@/lib/artistCatalog";
 import { catalogTracks } from "@/lib/catalog";
+import { getProfile, profileVersion, rankedTasteLangs, subscribeProfile } from "@/lib/profile";
+import { progressiveMix } from "@/lib/taste";
 import type { Track, Lang } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -209,13 +211,13 @@ function PageDots({ count, page, go, label }: { count: number; page: number; go:
 }
 
 /**
- * The listener's dominant language, derived from their OWN play history matched
+ * The listener's language weights, derived from their OWN play history matched
  * against the live catalog's lang data (history entries don't store lang).
  * Weighted by play count + recency, so a current Telugu phase outweighs an old
- * Hindi one. Returns null when there's no signal yet (cold start → the generic
- * mood query runs with zero language bias instead of a fake default).
+ * Hindi one. Feeds rankedTasteLangs (profile picks merge on top, in pick
+ * order) — an empty history with a profile still yields the picked order.
  */
-function dominantLang(plays: RecentPlay[], catalog: Track[]): Lang | null {
+function historyLangWeights(plays: RecentPlay[], catalog: Track[]): Map<string, number> {
   const langById = new Map<string, Lang>();
   const langByKey = new Map<string, Lang>();
   for (const t of catalog) {
@@ -223,25 +225,18 @@ function dominantLang(plays: RecentPlay[], catalog: Track[]): Lang | null {
     langById.set(t.id, t.lang);
     langByKey.set(keyOf(t), t.lang);
   }
-  const score = new Map<Lang, number>();
+  const score = new Map<string, number>();
   const now = Date.now();
   for (const p of plays) {
     const lang =
       langById.get(p.id) ??
-      langByKey.get(`${p.title.toLowerCase().trim()}|${(p.artist.split(",")[0] || "").toLowerCase().trim()}`);
+      langByKey.get(`${p.title.toLowerCase().trim()}|${(p.artist.split(",")[0] || "").toLowerCase().trim()}`) ??
+      p.lang;
     if (!lang) continue;
     const recency = 1 + Math.max(0, 1 - (now - p.at) / (21 * 864e5)); // 1..2, fades over 3 weeks
     score.set(lang, (score.get(lang) ?? 0) + Math.min(p.n, 12) * recency);
   }
-  let best: Lang | null = null;
-  let bestScore = 0;
-  for (const [lang, s] of score) {
-    if (s > bestScore) {
-      best = lang;
-      bestScore = s;
-    }
-  }
-  return best;
+  return score;
 }
 
 function SkelQuickPicks() {
@@ -418,6 +413,10 @@ export function HomeScreen() {
     setMounted(true);
   }, []);
 
+  // Taste profile — version-tracked so saving/retaking onboarding re-rolls the feed.
+  const profV = useSyncExternalStore(subscribeProfile, profileVersion, () => 0);
+  const profile = useMemo(() => (mounted ? getProfile() : null), [mounted, profV]);
+
   const histV = useSyncExternalStore(subscribeHistory, historyVersion, () => 0);
   // One random seed per mount → every full-page refresh re-rolls the discovery mix,
   // while staying stable across re-renders within the session.
@@ -463,14 +462,17 @@ export function HomeScreen() {
     };
   }, [seedInfo]);
 
-  // Taste language — snapshotted once per mount (like seedInfo) so mid-session
+  // Taste languages — snapshotted once per mount (like seedInfo) so mid-session
   // plays never re-roll the mood mixes under the user's eyes. undefined = still
-  // resolving, null = no signal (cold start).
-  const [tasteLang, setTasteLang] = useState<Lang | null | undefined>(undefined);
+  // resolving, null = no signal at all (cold start, no profile either).
+  // PROFILE FIRST: onboarding picks in pick order, then history weights —
+  // rankedTasteLangs merges both; progressiveMix enforces the 1-2-foreign cap.
+  const [tasteLangs, setTasteLangs] = useState<Lang[] | undefined>(undefined);
   useEffect(() => {
-    if (!mounted || !discPool || tasteLang !== undefined) return;
-    setTasteLang(dominantLang(recentPlays(40), discPool));
-  }, [mounted, discPool, tasteLang]);
+    if (!mounted || tasteLangs !== undefined) return;
+    setTasteLangs(rankedTasteLangs(historyLangWeights(recentPlays(40), discPool ?? [])));
+  }, [mounted, discPool, tasteLangs]);
+  const tasteLang = tasteLangs === undefined ? undefined : (tasteLangs[0] ?? null);
 
   // "Radio for you" — the personal radio shelf (hidden while loading / when empty).
   const because = useMemo(() => {
@@ -499,10 +501,12 @@ export function HomeScreen() {
     const last = lastIds(QP_LAST);
     let mix = seededShuffle(uniq(source), rnd).filter((t) => !last.has(t.id));
     if (mix.length < 18) mix = seededShuffle(uniq([...mix, ...discPool]), rnd).slice(0, 18);
-    const picks = mix.slice(0, 18); // two full 3×3 speed-dial pages
+    // the progressive language rule: outside-taste songs trickle in 1-2 at a time,
+    // evenly spread — never a block, never dominating the dial
+    const picks = progressiveMix(mix.slice(0, 18), tasteLangs ?? [], { rnd }); // two full 3×3 speed-dial pages
     saveIds(QP_LAST, picks);
     setQp(picks);
-  }, [discPool, radioPool, rnd]);
+  }, [discPool, radioPool, rnd, tasteLangs]);
 
   // ── Fresh picks: another re-roll, disjoint from Quick picks AND its own last set.
   //    Mood chips steer it as mood intent + YOUR language (from play history) —
@@ -520,7 +524,8 @@ export function HomeScreen() {
         try {
           let ts = await searchApi(q);
           if (ts.length === 0 && q !== base) ts = await searchApi(base).catch(() => []);
-          if (alive) setFresh(ts.slice(0, 10));
+          // mood mixes obey the same progressive language rule as the rest of the feed
+          if (alive) setFresh(progressiveMix(ts, tasteLangs ?? [], { cap: 2, rnd }).slice(0, 10));
         } catch {
           if (alive) setFresh([]);
         }
@@ -529,7 +534,7 @@ export function HomeScreen() {
         alive = false;
       };
     }
-    if (!discPool || !radioPool) return;
+    if (!discPool || !radioPool || tasteLangs === undefined) return;
     const exclude = new Set([...lastIds(QP_LAST), ...lastIds(FRESH_LAST)]);
     const radioPart = seededShuffle(uniq(radioPool).filter((t) => !exclude.has(t.id)), rnd);
     const radioIds = new Set(radioPart.map((t) => t.id));
@@ -539,10 +544,11 @@ export function HomeScreen() {
       const ids = new Set(mix.map((t) => t.id));
       mix = [...mix, ...seededShuffle(discPool.filter((t) => !ids.has(t.id)), rnd)];
     }
-    const picks = mix.slice(0, 12); // three full 4-row explore pages
+    // progressive language rule at the last step so ANY pool feeding this shelf obeys it
+    const picks = progressiveMix(mix.slice(0, 12), tasteLangs, { rnd }); // three full 4-row explore pages
     saveIds(FRESH_LAST, picks);
     setFresh(picks);
-  }, [mood, tasteLang, discPool, radioPool, rnd]);
+  }, [mood, tasteLang, tasteLangs, discPool, radioPool, rnd]);
 
   // ── Trending (live chart — no editorial fallback: hidden until it arrives) ──
   const [trending, setTrending] = useState<Track[] | null>(null);
@@ -583,6 +589,14 @@ export function HomeScreen() {
 
   return (
     <div className="space-y-10 pb-8">
+      {/* profile greeting — the "login" shows up as a personal hello (batch 2) */}
+      {mounted && profile && !profile.skipped && profile.name !== "Listener" && (
+        <p className="px-1 pt-1 text-sm text-muted-foreground" aria-live="polite">
+          Good to see you, <span className="font-semibold text-foreground">{profile.name}</span>
+          {tasteLang ? <span> · your {tasteLang} feed</span> : null}
+        </p>
+      )}
+
       {/* Mood chips — the feed opens straight into the filter chips, YTM-style */}
       <div className="no-scrollbar -mx-1 flex gap-2 overflow-x-auto px-1 pt-2">
         {MOOD_CHIPS.map((m) => (

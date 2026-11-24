@@ -14,6 +14,7 @@ import { Cover } from "../Cover";
 import { usePlayer } from "@/lib/player";
 import { catalogNow } from "@/lib/catalog";
 import { searchApi } from "@/lib/api";
+import { artistImage } from "@/lib/artistCatalog";
 import type { Track } from "@/lib/types";
 
 const fold = (s: string) =>
@@ -26,6 +27,20 @@ const fold = (s: string) =>
 
 export function ArtistView({ name, onBack }: { name: string; onBack: () => void }) {
   const { playTrack, toggleShuffle, shuffle } = usePlayer();
+
+  // The artist's real FACE (batch 2 photo fix) — falls back to the gradient
+  // disc while resolving / when no photo exists.
+  const [face, setFace] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    setFace(undefined);
+    artistImage(name)
+      .then((u) => alive && setFace(u))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [name]);
 
   // Catalog tracks (module-cached → instant) + a live search for the artist.
   const [live, setLive] = useState<Track[] | null>(null);
@@ -75,7 +90,13 @@ export function ArtistView({ name, onBack }: { name: string; onBack: () => void 
           <ArrowLeft className="h-5 w-5" />
         </button>
         <div className="flex flex-col items-center gap-6 text-center sm:flex-row sm:items-end sm:text-left">
-          <Cover from="#4a4a6a" to="#16161c" seed={`artist-page-${name}`} glyphSize="text-5xl" rounded="rounded-full" className="h-40 w-40 shrink-0 sm:h-48 sm:w-48" />
+          {face ? (
+            <span className="block h-40 w-40 shrink-0 overflow-hidden rounded-full border border-border bg-surface-2 sm:h-48 sm:w-48">
+              <img src={face} alt={name} className="h-full w-full object-cover" />
+            </span>
+          ) : (
+            <Cover from="#4a4a6a" to="#16161c" seed={`artist-page-${name}`} glyphSize="text-5xl" rounded="rounded-full" className="h-40 w-40 shrink-0 sm:h-48 sm:w-48" />
+          )}
           <div className="min-w-0 flex-1">
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground">Artist</p>
             <h1 className="mt-1 break-words text-3xl font-black tracking-tight sm:text-5xl">{name}</h1>

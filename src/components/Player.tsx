@@ -1,12 +1,14 @@
 "use client";
 
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnimatePresence, animate, motion, Reorder, useDragControls, useMotionValue, useTransform } from "framer-motion";
 import {
   ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Trash2, Volume2, VolumeX, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayer, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
+import { IS_NATIVE } from "@/lib/api";
+import { BOOST_GAINS, boostLabel, getBoostLevel, setBoostLevel, subscribeBoost } from "@/lib/loudness";
 import { registerBackHandler } from "@/lib/backStack";
 import { useCover } from "@/lib/covers";
 import { fmtTime } from "@/lib/data";
@@ -177,6 +179,36 @@ function SeekArea({
 // compact glass bar on mobile. Spotify touches: title hover-underline opens the
 // now-playing view, queue button lights when songs are manually queued.
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Loudness boost chip (Batch 2 — the "too low on phone/laptop" fix). Cycles
+ * Off → +30% → +60% → +100%. WEB routes the audio element through a Web Audio
+ * gain chain (real amplification); the APK raises the system MEDIA volume via
+ * WaveAudio.raiseMediaVolume (googlevideo has no CORS, so Web Audio would mute
+ * it) — either way the label shows the active boost.
+ */
+function BoostChip({ className }: { className?: string }) {
+  const level = useSyncExternalStore(subscribeBoost, getBoostLevel, () => 0);
+  return (
+    <button
+      onClick={() => setBoostLevel((level + 1) % BOOST_GAINS.length)}
+      aria-label={`Loudness boost: ${boostLabel()}`}
+      title={
+        IS_NATIVE
+          ? "Loudness boost — raises the media volume to max (tap to cycle, Off restores)"
+          : "Loudness boost — +30% / +60% / +100% amplification (tap to cycle)"
+      }
+      className={cn(
+        "flex h-9 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-bold transition",
+        level > 0 ? "bg-white/15 text-white" : "text-white/55 hover:bg-white/10 hover:text-white",
+        className
+      )}
+    >
+      {level > 0 ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+      <span className="tabular-nums">{level === 0 ? "Boost" : boostLabel()}</span>
+    </button>
+  );
+}
+
 export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQueuePanel: () => void; queuePanelOpen: boolean }) {
   const {
     current, isPlaying, progress, togglePlay, next, prev, setExpanded, likedIds, toggleLike, seek,
@@ -376,6 +408,7 @@ export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQue
               aria-label="Volume"
               style={{ background: `linear-gradient(to right, #f5f3ef ${volume * 100}%, rgba(255,255,255,0.2) ${volume * 100}%)` }}
             />
+            <BoostChip />
             <button
               onClick={onToggleQueuePanel}
               aria-label={queuePanelOpen ? "Close queue panel" : "Open queue panel"}
@@ -751,6 +784,7 @@ export function FullPlayer() {
                 </button>
               </div>
               <div className="flex items-center gap-2">
+                <BoostChip />
                 <button onClick={cycleRepeat} aria-label={repeat === 2 ? "Loop one" : repeat === 1 ? "Loop all" : "Loop off"} aria-pressed={repeat !== 0} title={`Loop: ${repeat === 2 ? "one song" : repeat === 1 ? "all" : "off"}`} className={cn("flex h-10 w-10 items-center justify-center rounded-full transition", repeat !== 0 ? "text-white" : "text-white/50 hover:text-white")}>
                   {repeat === 2 ? <Repeat1 className="h-5 w-5" /> : <Repeat className="h-5 w-5" />}
                 </button>

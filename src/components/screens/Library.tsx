@@ -10,9 +10,10 @@
  */
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { Heart, ListMusic } from "lucide-react";
+import { Heart, ListMusic, Settings2 } from "lucide-react";
 import { usePlayer } from "@/lib/player";
 import { colorFor } from "@/lib/data";
+import { OPEN_PROFILE_EVENT, profileVersion, subscribeProfile, getProfile } from "@/lib/profile";
 import {
   getUserPlaylists,
   playlistsVersion,
@@ -44,12 +45,40 @@ export function LibraryScreen({
 
   const likedCount = likedIds.size;
 
+  // taste profile summary (batch 2) — tap to retake onboarding
+  const profV = useSyncExternalStore(subscribeProfile, profileVersion, () => 0);
+  const [profMounted, setProfMounted] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setProfMounted(true), 0);
+    return () => clearTimeout(id);
+  }, []);
+  const profile = useMemo(() => (profMounted ? getProfile() : null), [profMounted, profV]);
+
   return (
     <div className="space-y-6 pb-8">
       <header className="px-1 pt-2">
         <h1 className="text-3xl font-black tracking-tight">Library</h1>
         <p className="mt-1 text-sm text-muted-foreground">Your liked songs and playlists.</p>
       </header>
+
+      {/* Your taste (batch 2) — the onboarding brain, editable anytime */}
+      {profile && !profile.skipped && (
+        <button
+          onClick={() => window.dispatchEvent(new Event(OPEN_PROFILE_EVENT))}
+          className="flex w-full items-center gap-4 rounded-2xl border border-border bg-surface-2 p-4 text-left transition hover:bg-surface-3"
+          aria-label="Edit your taste profile"
+        >
+          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--accent)]">
+            <Settings2 className="h-5 w-5 text-black" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-bold">{profile.name}&apos;s taste</span>
+            <span className="block truncate text-xs text-muted-foreground">
+              {profile.langs.join(", ") || "no languages"} · {profile.artists.length} favorite artist{profile.artists.length === 1 ? "" : "s"} · tap to edit
+            </span>
+          </span>
+        </button>
+      )}
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
         {/* Liked songs — the app's one real collection */}
