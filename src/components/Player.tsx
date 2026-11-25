@@ -47,10 +47,15 @@ export function GradientWash({ colors, className }: { colors: [string, string]; 
           transition={{ duration: 0.9, ease: "easeInOut" }}
           className="absolute inset-0"
         >
-          {/* the dominant color only — intensity falls monotonically down the page */}
+          {/* the dominant color only — intensity falls monotonically down the page.
+              Capped at 55% opacity over the ink base: YTM's tint never reaches full
+              brightness, so vivid artwork (orange posters, red album covers) reads
+              as a dark cinematic tint instead of a bright slab that clashes with
+              the app's near-black language (user-reported: orange top bar while the
+              queue sheet was open). */}
           <div
             className="absolute inset-0"
-            style={{ backgroundColor: colors[0], maskImage: WASH_FADE, WebkitMaskImage: WASH_FADE }}
+            style={{ backgroundColor: colors[0], maskImage: WASH_FADE, WebkitMaskImage: WASH_FADE, opacity: 0.55 }}
           />
         </motion.div>
       </AnimatePresence>
@@ -974,7 +979,10 @@ function QueueSheet({ current, onClose, variant = "sheet" }: { current: Track; o
             aria-label="Toggle autoplay"
             className={cn("relative h-5 w-9 rounded-full transition", autoplay ? "bg-[var(--accent)]" : "bg-white/20")}
           >
-            <span className={cn("absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all", autoplay ? "left-[18px]" : "left-0.5")} />
+            {/* knob flips dark on the white track — checked state used to be
+                track white + knob white = a featureless white blob (user-reported);
+                YTM's toggle is exactly this: white track, near-black knob. */}
+            <span className={cn("absolute top-0.5 h-4 w-4 rounded-full shadow transition-all", autoplay ? "left-[18px] bg-[var(--accent-foreground)]" : "left-0.5 bg-white")} />
           </button>
         </div>
       </div>
