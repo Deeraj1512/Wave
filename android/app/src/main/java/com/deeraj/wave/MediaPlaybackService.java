@@ -14,6 +14,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.AudioManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -75,6 +76,12 @@ public class MediaPlaybackService extends Service {
     static final String ACTION_UPDATE = "com.deeraj.wave.media.UPDATE";
     static final String ACTION_SHUFFLE = "com.deeraj.wave.media.SHUFFLE";
     static final String ACTION_LOOP = "com.deeraj.wave.media.LOOP";
+    /** Android 13+ draws the lock-screen card's buttons from the MediaSession's
+     *  PlaybackState and IGNORES notification actions — card taps come back as
+     *  these custom actions (handled in onCustomAction). Own namespace, distinct
+     *  from the ACTION_* service start intents. */
+    static final String CUSTOM_SHUFFLE = "com.deeraj.wave.card.SHUFFLE";
+    static final String CUSTOM_REPEAT = "com.deeraj.wave.card.REPEAT";
     static final String EXTRA_TITLE = "title";
     static final String EXTRA_ARTIST = "artist";
     static final String EXTRA_ALBUM = "album";
@@ -232,6 +239,19 @@ public class MediaPlaybackService extends Service {
                         mode == PlaybackStateCompat.REPEAT_MODE_ONE ? 2
                                 : mode == PlaybackStateCompat.REPEAT_MODE_ALL ? 1 : 0);
             }
+
+            // Android 13+ media card: the system sends card taps HERE — the card
+            // ignores notification actions on 13+ (Google's confirmed behavior
+            // change; its buttons are drawn from the PlaybackState instead, see
+            // applySessionState). No argument = toggle, same as the in-app chip.
+            @Override
+            public void onCustomAction(String action, Bundle extras) {
+                if (CUSTOM_SHUFFLE.equals(action)) {
+                    dispatch("shuffle");
+                } else if (CUSTOM_REPEAT.equals(action)) {
+                    dispatch("repeat");
+                }
+            }
         });
         session.setActive(true);
     }
@@ -338,6 +358,25 @@ public class MediaPlaybackService extends Service {
                                 | PlaybackStateCompat.ACTION_SEEK_TO
                                 | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE
                                 | PlaybackStateCompat.ACTION_SET_REPEAT_MODE)
+                        // Android 13+ card buttons: prev / play-pause / next come
+                        // from the semantic actions above; the card fills its two
+                        // REMAINING button slots with THESE custom actions —
+                        // shuffle and loop, in this order, so all five buttons
+                        // (prev · play-pause · next · shuffle · loop) are always
+                        // visible on the lock screen. The icons flip with the live
+                        // mode (the *_off glyphs carry the state — the 13+ card
+                        // never shows text labels); taps return via onCustomAction.
+                        .addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                                CUSTOM_SHUFFLE,
+                                shuffle ? "Shuffle on" : "Shuffle off",
+                                shuffle ? R.drawable.ic_wave_shuffle
+                                        : R.drawable.ic_wave_shuffle_off).build())
+                        .addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                                CUSTOM_REPEAT,
+                                repeat == 0 ? "Loop off" : repeat == 1 ? "Loop all" : "Loop one",
+                                repeat == 2 ? R.drawable.ic_wave_repeat_one
+                                        : repeat == 1 ? R.drawable.ic_wave_repeat
+                                        : R.drawable.ic_wave_repeat_off).build())
                         .setState(playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
                                 positionMs, playing ? 1f : 0f, now)
                         .build());
@@ -443,7 +482,8 @@ public class MediaPlaybackService extends Service {
                 .setOnlyAlertOnce(true)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-                .addAction(new NotificationCompat.Action(R.drawable.ic_wave_shuffle,
+                .addAction(new NotificationCompat.Action(
+                        shuffle ? R.drawable.ic_wave_shuffle : R.drawable.ic_wave_shuffle_off,
                         shuffle ? "Shuffle on" : "Shuffle off",
                         actionPi(ACTION_SHUFFLE, REQ_SHUFFLE)))
                 .addAction(new NotificationCompat.Action(android.R.drawable.ic_media_previous,
@@ -455,7 +495,9 @@ public class MediaPlaybackService extends Service {
                 .addAction(new NotificationCompat.Action(android.R.drawable.ic_media_next,
                         "Next", actionPi(ACTION_NEXT, REQ_NEXT)))
                 .addAction(new NotificationCompat.Action(
-                        repeat == 2 ? R.drawable.ic_wave_repeat_one : R.drawable.ic_wave_repeat,
+                        repeat == 2 ? R.drawable.ic_wave_repeat_one
+                                : repeat == 1 ? R.drawable.ic_wave_repeat
+                                : R.drawable.ic_wave_repeat_off,
                         repeat == 0 ? "Loop off" : repeat == 1 ? "Loop all" : "Loop one",
                         actionPi(ACTION_LOOP, REQ_LOOP)))
                 .setStyle(new MediaStyle()
