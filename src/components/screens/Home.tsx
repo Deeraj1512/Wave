@@ -18,15 +18,15 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Loader2, Music2, Play } from "lucide-react";
+import { Music2, Play } from "lucide-react";
 import { Shelf } from "../Shelf";
 import { SongCard, QuickPick, SpeedDialTile } from "../Cards";
 import { usePlayer } from "@/lib/player";
-import { useToast } from "@/hooks/use-toast";
 import { colorFor, MOOD_CHIPS } from "@/lib/data";
 import { searchApi, radioApi } from "@/lib/api";
 import { recentPlays, radioSeed, topArtists, subscribeHistory, historyVersion, seededRandom, seededShuffle, type RecentPlay } from "@/lib/history";
-import { radioArtists, artistImage, fold, isArtistTrack } from "@/lib/artistCatalog";
+import { radioArtists, artistImage, isArtistTrack } from "@/lib/artistCatalog";
+import { goToArtist } from "@/lib/goToArtist";
 import { catalogTracks } from "@/lib/catalog";
 import { getProfile, profileVersion, rankedTasteLangs, subscribeProfile } from "@/lib/profile";
 import { strictLangFilter, feedLangs, roundRobin, familiarWeave, familiarSet, rotateBy } from "@/lib/taste";
@@ -69,6 +69,33 @@ function saveIds(key: string, tracks: Track[]) {
     sessionStorage.setItem(key, JSON.stringify(tracks.map((t) => t.id)));
   } catch {
     /* private mode — exclusion simply doesn't persist */
+  }
+}
+
+// ── Made-for-you cache — the shelf must never randomly vanish. ──
+// localStorage (survives restarts, unlike the sessionStorage exclusion
+// sets) holds the last SUCCESSFUL set, tagged with the profile it was
+// built for. Every visit hydrates from it INSTANTLY and refreshes in the
+// background; a failed or thin refresh keeps the cache on screen instead
+// of erasing the shelf (the "comes and gone" bug the user reported).
+const FORYOU_CACHE = "wave.foryou.cache.v2";
+
+function readForYouCache(key: string): Track[] | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = JSON.parse(localStorage.getItem(FORYOU_CACHE) ?? "null") as { key: string; tracks: Track[] } | null;
+    if (raw && raw.key === key && Array.isArray(raw.tracks) && raw.tracks.length > 0) return raw.tracks;
+  } catch {
+    /* corrupt cache = no cache */
+  }
+  return null;
+}
+
+function saveForYouCache(key: string, tracks: Track[]) {
+  try {
+    localStorage.setItem(FORYOU_CACHE, JSON.stringify({ key, tracks }));
+  } catch {
+    /* private mode — the shelf just rebuilds each visit */
   }
 }
 
@@ -265,13 +292,12 @@ function playsToNum(p: string): number {
 }
 
 /**
- * Radio — the artist-profile shelf (user's ask: radio is an OPTION, never the
- * app's default behavior). Circular artist photos — your top listening artists
- * first, curated cross-language names for cold start. Tap → that artist's radio:
- * their top song seeds the queue, their songs fill the context, the smart radio
- * grows behind it (language-locked, artist-capped).
+ * Radio — the artist-profile shelf. Circular artist photos — your top
+ * listening artists first, curated cross-language names for cold start.
+ * Tap → opens the ARTIST PAGE (hero, Play/Shuffle, their song list) — the
+ * user's exact ask: the list opens first; nothing auto-plays on the tap.
  */
-function RadioShelf({ onArtist, busy }: { onArtist: (name: string) => void; busy: string | null }) {
+function RadioShelf({ onArtist }: { onArtist: (name: string) => void }) {
   const [artists, setArtists] = useState<string[] | null>(null);
   const [imgs, setImgs] = useState<Record<string, string>>({});
 
@@ -305,30 +331,23 @@ function RadioShelf({ onArtist, busy }: { onArtist: (name: string) => void; busy
     <section aria-label="Radio">
       <div className="mb-4 px-1">
         <h2 className="text-xl font-medium text-foreground sm:text-[22px]">Radio</h2>
-        <p className="mt-0.5 text-xs text-muted-foreground">Tap an artist to start their radio</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">Tap an artist to see their songs</p>
       </div>
       <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-1">
         {artists.map((name) => {
           const img = imgs[name];
-          const loading = busy === name;
           return (
             <button
               key={name}
               onClick={() => onArtist(name)}
-              disabled={!!busy}
               className="flex w-20 shrink-0 flex-col items-center gap-2"
-              aria-label={`Start ${name} radio`}
+              aria-label={`See ${name} songs`}
             >
               <span className="relative flex h-20 w-20 items-center justify-center overflow-hidden rounded-full border border-border bg-surface-2">
                 {img ? (
                   <img src={img} alt="" className="h-full w-full object-cover" loading="lazy" />
                 ) : (
                   <Music2 className="h-7 w-7 text-muted-foreground/60" />
-                )}
-                {loading && (
-                  <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/55">
-                    <Loader2 className="h-5 w-5 animate-spin text-white" />
-                  </span>
                 )}
               </span>
               <span className="w-full truncate text-center text-xs font-medium text-foreground/85">{name}</span>
@@ -405,9 +424,7 @@ function QuickPicksDial({ tracks }: { tracks: Track[] }) {
 
 export function HomeScreen() {
   const { playTrack, likedTracks: likedTracksRaw } = usePlayer();
-  const { toast } = useToast();
   const [mood, setMood] = useState("All");
-  const [radioBusy, setRadioBusy] = useState<string | null>(null);
 
   // Hydration safety: anything time-based, random-seeded, or localStorage-derived must
   // render deterministically on the server AND the first client render, then swap after
@@ -512,7 +529,13 @@ export function HomeScreen() {
       return;
     }
     let alive = true;
-    setForYou(null); // skeleton while the artist searches run
+    // INSTANT HYDRATE — the last SUCCESSFUL set (tagged to this profile)
+    // shows immediately; the refresh below only ever SWAPS it for a fresh
+    // set. The shelf can no longer sit invisible while the network works,
+    // and a failed refresh keeps what's on screen ("comes and gone" fix).
+    const cacheKey = `${p.name}|${p.artists.map((a) => a.name).join("+")}|${p.langs.join("+")}`;
+    const cached = readForYouCache(cacheKey);
+    setForYou(cached ?? null); // cached set → visible at once; first run → honest skeleton
     (async () => {
       try {
         // cast: onboarding picks — each WITH the language it was picked under —
@@ -536,11 +559,12 @@ export function HomeScreen() {
         // profile still fills the 7-page shelf (user wants 6-7 pages per
         // category, not 2-3).
         const perArtist = cast.length <= 2 ? 16 : 7;
-        const built: Array<{ lang: Lang; group: Track[]; ci: number }> = [];
-        for (let ci = 0; ci < cast.length; ci++) {
-          const c = cast[ci];
-          if (!alive) return;
-          try {
+        // PARALLEL — every artist's search fires together (this used to run
+        // sequentially: 8 slow round-trips made the shelf feel missing most
+        // of the time). One shy artist must not sink the shelf; allSettled
+        // keeps the survivors.
+        const settled = await Promise.allSettled(
+          cast.map(async (c, ci) => {
             let res = await searchApi(`${c.name} ${c.lang} songs`);
             let theirs = strictLangFilter(
               res.filter((t) => t.duration >= 45 && isArtistTrack(t, c.name)),
@@ -556,12 +580,14 @@ export function HomeScreen() {
               if (strict2.length > theirs.length) theirs = strict2;
             }
             const pool = [...theirs].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays)).slice(0, perArtist);
-            if (pool.length > 0) built.push({ lang: c.lang, group: pool, ci });
-          } catch {
-            /* one shy artist must not sink the shelf */
-          }
-        }
+            return { lang: c.lang, group: pool, ci };
+          })
+        );
         if (!alive) return;
+        const built: Array<{ lang: Lang; group: Track[]; ci: number }> = [];
+        for (const r of settled) {
+          if (r.status === "fulfilled" && r.value.group.length > 0) built.push(r.value);
+        }
 
         // groups in LANGUAGE PICK ORDER, then artist weight — the shelf
         // breathes Telugu → Tamil → Telugu exactly the way the user ranked
@@ -580,10 +606,13 @@ export function HomeScreen() {
         picks = picks.slice(0, 28); // 7 swipe pages × 4 rows (user's ask)
         if (alive && picks.length > 0) {
           saveIds(FORYOU_LAST, picks);
+          saveForYouCache(cacheKey, picks);
           setForYou(picks);
-        } else if (alive) setForYou([]);
+        } else if (alive && !cached) {
+          setForYou([]); // nothing new AND nothing cached → honest empty; a cached shelf stays
+        }
       } catch {
-        if (alive) setForYou([]);
+        if (alive && !cached) setForYou([]); // failed refresh → keep a hydrated cache
       }
     })();
     return () => {
@@ -711,39 +740,6 @@ export function HomeScreen() {
   const leftOff = useMemo(() => recent.map(histToTrack), [recent]);
   const likedTracks = useMemo(() => (mounted ? likedTracksRaw : []), [mounted, likedTracksRaw]);
 
-  // Artist radio — the Radio shelf's tap handler: seed their most-played song,
-  // context = their own songs, smart radio grows behind it. The tap is
-  // deliberate, but the language law still holds: the search is biased to the
-  // language the artist was picked under, and the pool passes the STRICT lock
-  // (undetectable rows presume that language; detected other languages drop).
-  const startArtistRadio = useCallback(
-    async (name: string) => {
-      if (radioBusy) return;
-      setRadioBusy(name);
-      try {
-        const p = getProfile();
-        const hasProfile = !!p && !p.skipped && p.langs.length > 0;
-        const langs = hasProfile ? p!.langs : [];
-        const pickLang = hasProfile ? p!.artists.find((a) => fold(a.name) === fold(name))?.lang : undefined;
-        const res = await searchApi(pickLang ? `${name} ${pickLang} songs` : `${name} songs`);
-        const theirs = res.filter((t) => fold(name) && t.artist.split(",").map((a) => fold(a)).some((a) => a === fold(name) || (fold(name).length > 3 && a.includes(fold(name)))));
-        const pool = (theirs.length >= 3 ? theirs : res).filter((t) => t.duration >= 45);
-        // STRICT, no presumption — the radio seed must be a ladder-proven song
-        // in a selected language, so the language-locked queue that grows
-        // behind it anchors in the right language
-        const locked = strictLangFilter(pool, langs);
-        if (locked.length === 0) throw new Error("no songs"); // honest error beats a foreign radio
-        const sorted = [...locked].sort((a, b) => playsToNum(b.plays) - playsToNum(a.plays));
-        playTrack(sorted[0], sorted, `${name} radio`);
-      } catch {
-        toast({ title: `Couldn't start ${name} radio`, description: "Check your connection and try again", duration: 3000 });
-      } finally {
-        setRadioBusy(null);
-      }
-    },
-    [playTrack, radioBusy, toast]
-  );
-
   return (
     <div className="space-y-10 pb-8">
       {/* Mood chips — the feed opens straight into the filter chips, YTM-style */}
@@ -817,8 +813,17 @@ export function HomeScreen() {
 
       {/* Made for you — the onboarding-picks shelf, placed just BELOW Quick
           picks (user's exact placement): their songs, their languages, in pick
-          order. Hidden when the user skipped onboarding or the artist
-          searches came back empty. */}
+          order. Hydrates from the cache instantly and refreshes in place —
+          the skeleton shows only on a genuinely first, cache-less load.
+          Hidden when the user skipped onboarding or there is genuinely
+          nothing. */}
+      {mounted && profile && !profile.skipped && forYou === null && (
+        <div aria-hidden className="space-y-2">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="h-16 animate-pulse rounded-lg bg-surface-2" />
+          ))}
+        </div>
+      )}
       {mounted && profile && !profile.skipped && forYou !== null && forYou.length > 0 && (
         <section aria-label="Made for you">
           <div className="mb-4 flex items-center justify-between px-1">
@@ -839,10 +844,11 @@ export function HomeScreen() {
         </section>
       )}
 
-      {/* Radio — artist profiles; tap → that artist's radio. Radio is a choice,
-          not the app's default behavior — it sits after the personal shelves
-          (Quick picks, Made for you), before Listen again. */}
-      <RadioShelf onArtist={(n) => void startArtistRadio(n)} busy={radioBusy} />
+      {/* Radio — artist profiles; tap opens the artist's SONG LIST (the
+          artist page — hero, Play, Shuffle). Nothing auto-plays from the
+          shelf tap (user's exact ask). Still after the personal shelves,
+          before Listen again. */}
+      <RadioShelf onArtist={(n) => goToArtist(n)} />
 
       {/* Listen again — real history */}
       {leftOff.length > 0 && (

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Disc3, ListPlus, ListStart, MoreVertical, Music, Play, Radio } from "lucide-react";
+import { Disc3, ListPlus, ListStart, Mic2, MoreVertical, Music, Play, Radio } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Track } from "@/lib/types";
 import { usePlayer } from "@/lib/player";
@@ -9,12 +9,13 @@ import { useCover } from "@/lib/covers";
 import { useToast } from "@/hooks/use-toast";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { canGoToAlbum, openAlbumFor } from "@/lib/goToAlbum";
-import { AddToPlaylistSheet } from "./PlayerMenus";
+import { goToArtist, splitArtists } from "@/lib/goToArtist";
+import { AddToPlaylistSheet, DownloadMenuItem } from "./PlayerMenus";
 import { Cover } from "./Cover";
 
 /**
  * The song three-dot menu — Play next · Add to queue · Add to playlist · Go to
- * album · Start radio — shared by every card surface (Quick picks, home
+ * album · Go to artist · Start radio — shared by every card surface (Quick picks, home
  * shelves, Explore) so the queue + library + album actions follow the song
  * wherever it appears (TrackRow carries the same menu for lists).
  */
@@ -68,6 +69,16 @@ function SongCardMenu({ track }: { track: Track }) {
             <Disc3 className="h-4 w-4 text-muted-foreground" /> Go to album
           </DropdownMenuItem>
         )}
+        {splitArtists(track.artist).map((name) => (
+          <DropdownMenuItem key={name} onClick={() => goToArtist(name)} className="gap-2.5">
+            <Mic2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span className="min-w-0">
+              <span className="block">Go to artist</span>
+              <span className="block truncate text-xs text-muted-foreground">{name}</span>
+            </span>
+          </DropdownMenuItem>
+        ))}
+        <DownloadMenuItem track={track} />
         <DropdownMenuItem
           onClick={() => {
             startRadio(track);

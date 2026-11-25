@@ -725,9 +725,13 @@ export function FullPlayer() {
                   {[current.artist, current.year > 0 ? current.year : null, current.lang].filter(Boolean).join(" · ")}
                 </p>
               </div>
-              <button onClick={() => toggleLike(current.id, current)} aria-label={likedIds.has(current.id) ? "Unlike" : "Like"} className="mt-1 shrink-0">
-                <Heart className={cn("h-6 w-6 transition", likedIds.has(current.id) ? "scale-110 fill-white text-white" : "text-white/60 hover:text-white")} />
-              </button>
+              {/* HQ chip beside the like button — the user's exact placement */}
+              <div className="mt-1 flex shrink-0 items-center gap-1">
+                <QualityChip />
+                <button onClick={() => toggleLike(current.id, current)} aria-label={likedIds.has(current.id) ? "Unlike" : "Like"}>
+                  <Heart className={cn("h-6 w-6 transition", likedIds.has(current.id) ? "scale-110 fill-white text-white" : "text-white/60 hover:text-white")} />
+                </button>
+              </div>
             </div>
 
             {/* muted-autoplay recovery pill */}
@@ -785,7 +789,6 @@ export function FullPlayer() {
                 </button>
               </div>
               <div className="flex items-center gap-2">
-                <QualityChip />
                 <button onClick={cycleRepeat} aria-label={repeat === 2 ? "Loop one" : repeat === 1 ? "Loop all" : "Loop off"} aria-pressed={repeat !== 0} title={`Loop: ${repeat === 2 ? "one song" : repeat === 1 ? "all" : "off"}`} className={cn("flex h-10 w-10 items-center justify-center rounded-full transition", repeat !== 0 ? "text-white" : "text-white/50 hover:text-white")}>
                   {repeat === 2 ? <Repeat1 className="h-5 w-5" /> : <Repeat className="h-5 w-5" />}
                 </button>

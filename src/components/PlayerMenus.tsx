@@ -16,10 +16,13 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import { Check, Disc3, ListMusic, ListPlus, Music, Plus, Timer, X } from "lucide-react";
+import { Check, Disc3, Download, ListMusic, ListPlus, Loader2, Mic2, Music, Plus, Timer, Trash2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { usePlayer, type SleepTimerState } from "@/lib/player";
 import { canGoToAlbum, openAlbumFor } from "@/lib/goToAlbum";
+import { goToArtist, splitArtists } from "@/lib/goToArtist";
+import { downloadTrack, removeDownload, useDownloadStatus } from "@/lib/downloads";
 import { useToast } from "@/hooks/use-toast";
 import {
   addToUserPlaylist,
@@ -281,6 +284,92 @@ export function AddToPlaylistBody({ track, onPicked }: { track: Track; onPicked?
 
 // ── the players' direct sheets ──────────────────────────────────────────────
 
+/** "Download" / progress / "Remove download" — the offline-copy control
+ * shared by every song menu (rows, cards). One status per song, live:
+ * idle → "Download", in-flight → disabled percent row, saved → remove. */
+export function DownloadMenuItem({ track }: { track: Track }) {
+  const { toast } = useToast();
+  const { downloaded, progress } = useDownloadStatus(track.id);
+  if (progress !== null) {
+    return (
+      <DropdownMenuItem disabled className="gap-2.5">
+        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+        Downloading… {progress}%
+      </DropdownMenuItem>
+    );
+  }
+  if (downloaded) {
+    return (
+      <DropdownMenuItem
+        onClick={() => {
+          void removeDownload(track.id).then((ok) => {
+            toast({ title: ok ? "Download removed" : "Couldn't remove download", duration: 2500 });
+          });
+        }}
+        className="gap-2.5"
+      >
+        <Trash2 className="h-4 w-4 text-muted-foreground" /> Remove download
+      </DropdownMenuItem>
+    );
+  }
+  return (
+    <DropdownMenuItem
+      onClick={() => {
+        void downloadTrack(track).then((ok) => {
+          toast({ title: ok ? "Downloaded — plays offline" : "Download failed", duration: 3000 });
+        });
+      }}
+      className="gap-2.5"
+    >
+      <Download className="h-4 w-4 text-muted-foreground" /> Download
+    </DropdownMenuItem>
+  );
+}
+
+/** the ⋮ menu's download row (full player) — DownloadMenuItem's SheetRow twin */
+function PlayerDownloadRow({ track, onClose }: { track: Track; onClose: () => void }) {
+  const { toast } = useToast();
+  const { downloaded, progress } = useDownloadStatus(track.id);
+  if (progress !== null) {
+    return (
+      <SheetRow
+        icon={<Loader2 className="h-4.5 w-4.5 animate-spin" />}
+        title="Downloading…"
+        subtitle={`${progress}%`}
+        onClick={() => { /* in-flight — no-op */ }}
+      />
+    );
+  }
+  if (downloaded) {
+    return (
+      <SheetRow
+        icon={<Trash2 className="h-4.5 w-4.5" />}
+        title="Remove download"
+        subtitle="Delete the saved offline copy"
+        onClick={() => {
+          onClose();
+          void removeDownload(track.id).then((ok) => {
+            toast({ title: ok ? "Download removed" : "Couldn't remove download", duration: 2500 });
+          });
+        }}
+      />
+    );
+  }
+  return (
+    <SheetRow
+      icon={<Download className="h-4.5 w-4.5" />}
+      title="Download"
+      subtitle="Save to play offline"
+      onClick={() => {
+        onClose();
+        void downloadTrack(track).then((ok) => {
+          toast({ title: ok ? "Downloaded — plays offline" : "Download failed", duration: 3000 });
+        });
+      }}
+    />
+  );
+}
+
 /** "More options" — the full player's ⋮ menu: routes to Add to playlist,
  *  Sleep timer and the Queue. Lives as the single action button in the
  *  expanded player's header. */
@@ -325,6 +414,23 @@ export function MoreOptionsSheet({
                 }}
               />
             )}
+            {current &&
+              splitArtists(current.artist).map((name) => (
+                <SheetRow
+                  key={name}
+                  icon={<Mic2 className="h-4.5 w-4.5" />}
+                  title="Go to artist"
+                  subtitle={name}
+                  onClick={() => {
+                    onClose();
+                    // no resolution step — each artist's page slides up OVER
+                    // this player instantly while the player stays open
+                    // underneath
+                    goToArtist(name);
+                  }}
+                />
+              ))}
+              {current && <PlayerDownloadRow track={current} onClose={onClose} />}
             <SheetRow
               icon={<Timer className="h-4.5 w-4.5" />}
               title="Sleep timer"

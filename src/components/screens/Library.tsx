@@ -10,7 +10,7 @@
  */
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { Heart, ListMusic, Settings2 } from "lucide-react";
+import { Download, Heart, ListMusic, Settings2 } from "lucide-react";
 import { usePlayer } from "@/lib/player";
 import { colorFor } from "@/lib/data";
 import { OPEN_PROFILE_EVENT, profileVersion, subscribeProfile, getProfile } from "@/lib/profile";
@@ -20,13 +20,16 @@ import {
   subscribePlaylists,
   type UserPlaylist,
 } from "@/lib/playlists";
+import { fmtSize, useDownloadsList } from "@/lib/downloads";
 
 export function LibraryScreen({
   onOpenLiked,
   onOpenPlaylist,
+  onOpenDownloads,
 }: {
   onOpenLiked: () => void;
   onOpenPlaylist: (id: string) => void;
+  onOpenDownloads: () => void;
 }) {
   const { likedIds } = usePlayer();
 
@@ -44,6 +47,10 @@ export function LibraryScreen({
   );
 
   const likedCount = likedIds.size;
+
+  // Downloads (batch 8) — songs saved on-device; metadata-only store so
+  // listing never loads a single audio blob.
+  const { metas: downloadMetas, totalSize } = useDownloadsList();
 
   // taste profile summary (batch 2) — tap to retake onboarding
   const profV = useSyncExternalStore(subscribeProfile, profileVersion, () => 0);
@@ -93,6 +100,22 @@ export function LibraryScreen({
           </div>
           <p className="mt-3 truncate text-sm font-bold">Liked songs</p>
           <p className="mt-0.5 truncate text-xs text-muted-foreground">Your collection</p>
+        </button>
+
+        {/* Downloads — songs saved on-device, playable with zero network */}
+        <button onClick={onOpenDownloads} className="group text-left" aria-label="Open downloads">
+          <div className="relative">
+            <div className="flex aspect-square w-full flex-col items-center justify-center rounded-2xl bg-gradient-to-br from-[#2f5d50] to-[#12211d] shadow-lg shadow-black/40 transition group-hover:from-[#3a7263]">
+              <Download className="h-10 w-10 text-white/90" />
+              <p className="mt-2 text-sm font-medium text-white/90">
+                {downloadMetas.length} song{downloadMetas.length === 1 ? "" : "s"}
+              </p>
+            </div>
+          </div>
+          <p className="mt-3 truncate text-sm font-bold">Downloads</p>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {downloadMetas.length > 0 ? `${fmtSize(totalSize)} · plays offline` : "Save songs to play offline"}
+          </p>
         </button>
 
         {/* User-created playlists — real data, newest first */}
