@@ -85,6 +85,15 @@ public class WaveAudioPlugin extends Plugin {
         if (positionSec != null && positionSec >= 0 && !positionSec.isNaN()) {
             i.putExtra(MediaPlaybackService.EXTRA_POSITION, positionSec);
         }
+        // lock-screen mode buttons (absent → the service keeps its current mode)
+        Boolean shuffle = call.getBoolean("shuffle");
+        if (shuffle != null) {
+            i.putExtra(MediaPlaybackService.EXTRA_SHUFFLE, shuffle);
+        }
+        Integer repeat = call.getInt("repeat");
+        if (repeat != null && repeat >= 0 && repeat <= 2) {
+            i.putExtra(MediaPlaybackService.EXTRA_REPEAT, repeat);
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(i);

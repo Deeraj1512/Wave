@@ -44,7 +44,8 @@ import java.util.concurrent.Executors;
  *     mediaPlayback type keeps the process alive; the partial wake lock (held only
  *     while actually playing) keeps CPU/network up with the screen off.
  *  2. CONTROLS: a MediaStyle notification bound to a real MediaSession —
- *     previous / play-pause / next buttons, song + artist + album + cover art,
+ *     shuffle / previous / play-pause / next / loop buttons, song + artist +
+ *     album + cover art,
  *     lock-screen visibility. Every button (and every headset/bluetooth media key
  *     via the session callbacks) is routed INTO the web player through
  *     window.__waveMediaAction(action) on the live WebView, so the HTML5 audio
@@ -64,12 +65,16 @@ public class MediaPlaybackService extends Service {
     private static final int REQ_PREV = 14;
     private static final int REQ_OPEN = 15;
     private static final int REQ_DELETE = 16;
+    private static final int REQ_SHUFFLE = 17;
+    private static final int REQ_LOOP = 18;
 
     static final String ACTION_PLAY = "com.deeraj.wave.media.PLAY";
     static final String ACTION_PAUSE = "com.deeraj.wave.media.PAUSE";
     static final String ACTION_NEXT = "com.deeraj.wave.media.NEXT";
     static final String ACTION_PREV = "com.deeraj.wave.media.PREV";
     static final String ACTION_UPDATE = "com.deeraj.wave.media.UPDATE";
+    static final String ACTION_SHUFFLE = "com.deeraj.wave.media.SHUFFLE";
+    static final String ACTION_LOOP = "com.deeraj.wave.media.LOOP";
     static final String EXTRA_TITLE = "title";
     static final String EXTRA_ARTIST = "artist";
     static final String EXTRA_ALBUM = "album";
@@ -77,6 +82,8 @@ public class MediaPlaybackService extends Service {
     static final String EXTRA_PLAYING = "playing";
     static final String EXTRA_DURATION = "duration";
     static final String EXTRA_POSITION = "position";
+    static final String EXTRA_SHUFFLE = "shuffle";
+    static final String EXTRA_REPEAT = "repeat";
 
     /** The live WebView (set by MainActivity) — transport actions are evaluated into the web player. */
     private static WeakReference<WebView> webViewRef = new WeakReference<>(null);
@@ -132,6 +139,11 @@ public class MediaPlaybackService extends Service {
     private Bitmap art;
     private String loadedArtUrl = "";
     private boolean artInFlight = false;
+
+    // lock-screen mode buttons — mirrored FROM the web player via UPDATE extras,
+    // toggled back INTO it through window.__waveMediaAction('shuffle'/'repeat')
+    private boolean shuffle = false;
+    private int repeat = 0; // 0 = off · 1 = loop all · 2 = loop one
 
     // seek-bar state: duration from JS, position anchored at the last
     // applySessionState() and extrapolated against the wall clock while playing
@@ -203,6 +215,23 @@ public class MediaPlaybackService extends Service {
                 applySessionState();
                 dispatch("seek", pos / 1000.0);
             }
+
+            // Bluetooth AVRCP / Wear / assistant mode toggles arrive here with an
+            // ABSOLUTE target mode; the web player accepts 'shuffle'/'repeat'
+            // with a numeric argument as "set to this exact mode" (1/0 and 0/1/2).
+            // NOTE: the mode constants live on PlaybackStateCompat, NOT on
+            // MediaSessionCompat (androidx.media 1.7.0) — verified by ECJ.
+            @Override
+            public void onSetShuffleMode(int mode) {
+                dispatch("shuffle", mode == PlaybackStateCompat.SHUFFLE_MODE_ALL ? 1 : 0);
+            }
+
+            @Override
+            public void onSetRepeatMode(int mode) {
+                dispatch("repeat",
+                        mode == PlaybackStateCompat.REPEAT_MODE_ONE ? 2
+                                : mode == PlaybackStateCompat.REPEAT_MODE_ALL ? 1 : 0);
+            }
         });
         session.setActive(true);
     }
@@ -218,6 +247,10 @@ public class MediaPlaybackService extends Service {
             dispatch("next");
         } else if (ACTION_PREV.equals(action)) {
             dispatch("prev");
+        } else if (ACTION_SHUFFLE.equals(action)) {
+            dispatch("shuffle");
+        } else if (ACTION_LOOP.equals(action)) {
+            dispatch("repeat");
         } else if (ACTION_UPDATE.equals(action)) {
             String t = intent.getStringExtra(EXTRA_TITLE);
             if (t != null && !t.trim().isEmpty()) title = t.trim();
@@ -239,6 +272,14 @@ public class MediaPlaybackService extends Service {
                 positionMs = Math.max(0, (long) (p * 1000.0));
             } else {
                 positionMs = extrapolatedPositionMs();
+            }
+            // mode buttons: extras only ride along when present — an absent
+            // extra leaves the service's current mode untouched
+            if (intent.hasExtra(EXTRA_SHUFFLE)) {
+                shuffle = intent.getBooleanExtra(EXTRA_SHUFFLE, shuffle);
+            }
+            if (intent.hasExtra(EXTRA_REPEAT)) {
+                repeat = Math.max(0, Math.min(2, intent.getIntExtra(EXTRA_REPEAT, repeat)));
             }
         } else {
             // transport intents (play/pause/next/prev from the card itself)
@@ -280,13 +321,23 @@ public class MediaPlaybackService extends Service {
         if (session != null) {
             try {
                 long now = SystemClock.elapsedRealtime();
+                // advertise the live modes so BT AVRCP / Wear / assistants keep
+                // their own shuffle-loop toggles in sync (and may drive them)
+                // (mode constants live on PlaybackStateCompat, not MediaSessionCompat)
+                session.setShuffleMode(shuffle ? PlaybackStateCompat.SHUFFLE_MODE_ALL
+                        : PlaybackStateCompat.SHUFFLE_MODE_NONE);
+                session.setRepeatMode(repeat == 2 ? PlaybackStateCompat.REPEAT_MODE_ONE
+                        : repeat == 1 ? PlaybackStateCompat.REPEAT_MODE_ALL
+                        : PlaybackStateCompat.REPEAT_MODE_NONE);
                 session.setPlaybackState(new PlaybackStateCompat.Builder()
                         .setActions(PlaybackStateCompat.ACTION_PLAY
                                 | PlaybackStateCompat.ACTION_PAUSE
                                 | PlaybackStateCompat.ACTION_PLAY_PAUSE
                                 | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
                                 | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
-                                | PlaybackStateCompat.ACTION_SEEK_TO)
+                                | PlaybackStateCompat.ACTION_SEEK_TO
+                                | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE
+                                | PlaybackStateCompat.ACTION_SET_REPEAT_MODE)
                         .setState(playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
                                 positionMs, playing ? 1f : 0f, now)
                         .build());
@@ -392,6 +443,9 @@ public class MediaPlaybackService extends Service {
                 .setOnlyAlertOnce(true)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                .addAction(new NotificationCompat.Action(R.drawable.ic_wave_shuffle,
+                        shuffle ? "Shuffle on" : "Shuffle off",
+                        actionPi(ACTION_SHUFFLE, REQ_SHUFFLE)))
                 .addAction(new NotificationCompat.Action(android.R.drawable.ic_media_previous,
                         "Previous", actionPi(ACTION_PREV, REQ_PREV)))
                 .addAction(new NotificationCompat.Action(
@@ -400,9 +454,13 @@ public class MediaPlaybackService extends Service {
                         actionPi(playing ? ACTION_PAUSE : ACTION_PLAY, playing ? REQ_PAUSE : REQ_PLAY)))
                 .addAction(new NotificationCompat.Action(android.R.drawable.ic_media_next,
                         "Next", actionPi(ACTION_NEXT, REQ_NEXT)))
+                .addAction(new NotificationCompat.Action(
+                        repeat == 2 ? R.drawable.ic_wave_repeat_one : R.drawable.ic_wave_repeat,
+                        repeat == 0 ? "Loop off" : repeat == 1 ? "Loop all" : "Loop one",
+                        actionPi(ACTION_LOOP, REQ_LOOP)))
                 .setStyle(new MediaStyle()
                         .setMediaSession(session == null ? null : session.getSessionToken())
-                        .setShowActionsInCompactView(0, 1, 2))
+                        .setShowActionsInCompactView(1, 2, 3))
                 .build();
     }
 
