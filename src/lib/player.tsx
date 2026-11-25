@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang, Track } from "./types";
 import { audioUrlFor, radioApi, searchApi, IS_NATIVE, resolveNativeAudio, invalidateNativeAudio, browserSupportsOpus } from "./api";
-import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, getNativePlaybackState } from "./nativeBackground";
+import { notifyPlayState, notifyNativeMedia, notifyNativeProgress, notifyNativeModes, getNativePlaybackState } from "./nativeBackground";
 import { recordPlay, topArtists } from "./history";
 import { detectTrackLang, inferLiveLang } from "./langs";
 import { rememberHeard, filterFresh, isStaleSession } from "./queueVariety";
@@ -11,6 +11,7 @@ import { familiarSet } from "./taste";
 import { setPreferredCodec, getPreferredQuality } from "./yt/resolve";
 import { baseTitle, capArtists, relateBlock } from "./queueBlock";
 import * as ytEmbed from "./ytEmbed";
+import { getDownloadedAudio } from "./downloads";
 import {
   initMediaSession,
   syncTrackMetadata,
@@ -26,6 +27,18 @@ import {
 /** a real YouTube videoId: exactly 11 url-safe chars (mock catalog ids are "t01"-style) */
 const VIDEO_ID_RE = /^[\w-]{11}$/;
 const JUNK_RE = /\bremix\b|\bmashup\b|\binstrumental\b|\bkaraoke\b|\bcover\b|\bslowed\b|\breverb\b|\bsped\s?up\b|\b8d\b|\bnightcore\b|\bjukebox\b|\blofi\b/i;
+
+// ── downloads (batch 8) ────────────────────────────────────────────────────
+// The object URL of the current downloaded-blob source. A saved song plays
+// straight from storage; when the next track arms (blob or network) the old
+// URL is revoked so downloaded audio never leaks memory.
+let activeBlobUrl: string | null = null;
+function releaseActiveBlob() {
+  if (activeBlobUrl) {
+    try { URL.revokeObjectURL(activeBlobUrl); } catch { /* already gone */ }
+    activeBlobUrl = null;
+  }
+}
 
 /** Where the user can ALWAYS hear this track — real videoId → watch page, mock id → search. */
 export function ytLinkFor(t: Track): string {
@@ -949,6 +962,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       };
       void (async () => {
         try {
+          // DOWNLOADED FIRST (batch 8): a saved copy plays straight from the
+          // device — no resolve, no proxy, no 8s deadline, works fully offline.
+          // A session-restore directUrl is IGNORED here: the saved bytes are
+          // always fresher than any stored googlevideo URL.
+          releaseActiveBlob();
+          const savedBlob = await getDownloadedAudio(track.id);
+          if (savedBlob && isLive()) {
+            settled = true;
+            activeBlobUrl = URL.createObjectURL(savedBlob);
+            armDirect(activeBlobUrl, onErrDirect);
+            return;
+          }
           if (opts?.directUrl) {
             // INSTANT CONTINUE (refresh / cold start): re-arm the exact stream URL
             // that was live before the page went away — playback restarts in well
@@ -1666,6 +1691,35 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     return currentRef.current?.duration ?? 0;
   }, []);
 
+  const toggleShuffle = useCallback(() => {
+    const on = !shuffleRef.current;
+    const q = queueRef.current;
+    const i = queueIndexRef.current;
+    const cur = q[i];
+    shuffleRef.current = on;
+    setShuffle(on);
+    if (!cur) return;
+    if (on) {
+      // save the upcoming non-manual order for restore; manual block keeps its order
+      const upcoming = q.slice(i + 1);
+      const manual = upcoming.filter((x) => x.layer === "manual");
+      const rest = upcoming.filter((x) => x.layer !== "manual");
+      savedOrderRef.current = rest;
+      setQueue([...q.slice(0, i), cur, ...manual, ...balancedShuffle(rest)]);
+    } else {
+      const before = q.slice(0, i);
+      const manual = q.slice(i + 1).filter((x) => x.layer === "manual");
+      const saved = savedOrderRef.current ?? [];
+      const savedIds = new Set(saved.map((x) => x.uid));
+      // radio tracks appended while shuffled (not in the saved block) stay at the end
+      const extra = q.slice(i + 1).filter((x) => x.layer === "radio" && !savedIds.has(x.uid));
+      setQueue([...before, cur, ...manual, ...saved, ...extra]);
+      savedOrderRef.current = null;
+    }
+  }, []);
+
+  const cycleRepeat = useCallback(() => setRepeat((r) => ((r + 1) % 3) as RepeatMode), []);
+
   // handlers once at mount — closures read refs, so they stay current across engines
   useEffect(() => {
     initMediaSession({
@@ -1698,6 +1752,25 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         } else if (action === "seek") {
           // card seek bar / scrub — pos arrives in SECONDS from the service
           if (typeof pos === "number" && Number.isFinite(pos) && pos >= 0) seek(pos);
+        } else if (action === "shuffle") {
+          // lock-screen shuffle button: no argument = flip it; 1/0 = set on/off
+          // (the numeric form arrives from Bluetooth/assistant mode intents)
+          if (pos === 1 || pos === 0) {
+            if (shuffleRef.current !== !!pos) toggleShuffle();
+          } else {
+            toggleShuffle();
+          }
+        } else if (action === "repeat") {
+          // lock-screen loop button: no argument = cycle off → all → one; 0/1/2 =
+          // jump to that exact mode. cycleRepeat() queues functional increments,
+          // so chaining (pos - current + 3) % 3 of them from the CURRENT ref
+          // lands exactly on the target even before React commits.
+          if (pos === 0 || pos === 1 || pos === 2) {
+            const delta = (pos - repeatRef.current + 3) % 3;
+            for (let k = 0; k < delta; k++) cycleRepeat();
+          } else {
+            cycleRepeat();
+          }
         }
       } catch {
         /* a dead card button must never crash the player */
@@ -1707,12 +1780,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       delete w.__waveMediaAction;
       clearMediaSession();
     };
-  }, [togglePlay, next, prev, seek, readPosition, readDuration]);
+  }, [togglePlay, next, prev, seek, readPosition, readDuration, toggleShuffle, cycleRepeat]);
 
   // card content follows the queue (id in deps: the mock→videoId swap re-syncs artwork).
-  // The album line doubles as the queue-mode readout: the MediaSession API offers no
-  // shuffle/repeat actions (the OS renders only fixed transport buttons), so at least
-  // the lock-screen card SHOWS the active mode — and prev/next already obey it (refs).
+  // The album line still doubles as the queue-mode readout on the WEB MediaSession
+  // card (the MediaSession API offers no shuffle/repeat buttons). The APK lock-screen
+  // card has REAL shuffle/loop buttons now — its subtitle stays clean and the mode
+  // state travels via notifyNativeModes() instead.
   const modeHint = [shuffle ? "Shuffle on" : "", repeat === 1 ? "Loop all" : "", repeat === 2 ? "Loop one" : ""]
     .filter(Boolean)
     .join(" · ");
@@ -1741,7 +1815,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ? {
             title: current.title,
             artist: current.artist,
-            album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
+            album: (current.album || current.movie || "").trim(),
             cover: current.cover,
             playing: isPlayingRef.current,
             duration: current.duration > 0 ? current.duration : undefined,
@@ -1749,7 +1823,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           }
         : null
     );
-  }, [current?.id, current?.title, current?.artist, current?.album, current?.movie, current?.cover, modeHint]);
+  }, [current?.id, current?.title, current?.artist, current?.album, current?.movie, current?.cover]);
 
   // mirror isPlaying — a stale state renders a dead ⏸/▶ button
   useEffect(() => {
@@ -1769,7 +1843,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ? {
             title: current.title,
             artist: current.artist,
-            album: [(current.album || current.movie || "").trim(), modeHint].filter(Boolean).join(" · "),
+            album: (current.album || current.movie || "").trim(),
             cover: current.cover,
             playing: isPlaying,
             // exact seek-bar state at every play/pause transition — readDuration
@@ -1779,7 +1853,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           }
         : null
     );
-  }, [isPlaying, readPosition, readDuration, current, modeHint]);
+  }, [isPlaying, readPosition, readDuration, current]);
+
+  // lock-screen shuffle/loop buttons follow the player's mode state (APK card).
+  // notifyNativeModes remembers them even while no card exists yet — the state
+  // rides along on the next update push instead.
+  useEffect(() => {
+    notifyNativeModes(shuffle, repeat);
+  }, [shuffle, repeat]);
 
   // ~1Hz scrubber sync while progress ticks (500ms embed poll / timeupdate / sim 1s)
   const nativeResyncTickRef = useRef(0);
@@ -1929,34 +2010,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [playRadio]
   );
 
-  const toggleShuffle = useCallback(() => {
-    const on = !shuffleRef.current;
-    const q = queueRef.current;
-    const i = queueIndexRef.current;
-    const cur = q[i];
-    shuffleRef.current = on;
-    setShuffle(on);
-    if (!cur) return;
-    if (on) {
-      // save the upcoming non-manual order for restore; manual block keeps its order
-      const upcoming = q.slice(i + 1);
-      const manual = upcoming.filter((x) => x.layer === "manual");
-      const rest = upcoming.filter((x) => x.layer !== "manual");
-      savedOrderRef.current = rest;
-      setQueue([...q.slice(0, i), cur, ...manual, ...balancedShuffle(rest)]);
-    } else {
-      const before = q.slice(0, i);
-      const manual = q.slice(i + 1).filter((x) => x.layer === "manual");
-      const saved = savedOrderRef.current ?? [];
-      const savedIds = new Set(saved.map((x) => x.uid));
-      // radio tracks appended while shuffled (not in the saved block) stay at the end
-      const extra = q.slice(i + 1).filter((x) => x.layer === "radio" && !savedIds.has(x.uid));
-      setQueue([...before, cur, ...manual, ...saved, ...extra]);
-      savedOrderRef.current = null;
-    }
-  }, []);
-
-  const cycleRepeat = useCallback(() => setRepeat((r) => ((r + 1) % 3) as RepeatMode), []);
 
   const toggleAutoplay = useCallback(() => {
     setAutoplay((a) => {

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { PlayerProvider, usePlayer } from "@/lib/player";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { registerBackHandler, unregisterBackHandler } from "@/lib/backStack";
 import { TopBar, Sidebar, BottomNav } from "@/components/Shell";
 import { MiniPlayer, FullPlayer, QueuePanel } from "@/components/Player";
@@ -14,15 +15,20 @@ import { ExploreScreen } from "@/components/screens/Explore";
 import { LibraryScreen } from "@/components/screens/Library";
 import { LikedView, UserPlaylistView } from "@/components/screens/PlaylistView";
 import { AlbumView } from "@/components/screens/AlbumView";
+import { ArtistView } from "@/components/screens/ArtistView";
+import { DownloadsView } from "@/components/screens/DownloadsView";
 import { Onboarding, useOnboardingGate } from "@/components/Onboarding";
 import { OPEN_ALBUM_EVENT } from "@/lib/goToAlbum";
+import { OPEN_ARTIST_EVENT } from "@/lib/goToArtist";
 import type { Screen } from "@/lib/types";
 
 export default function Page() {
   return (
-    <PlayerProvider>
-      <AppShell />
-    </PlayerProvider>
+    <ErrorBoundary>
+      <PlayerProvider>
+        <AppShell />
+      </PlayerProvider>
+    </ErrorBoundary>
   );
 }
 
@@ -42,6 +48,7 @@ function AppShell() {
   // closing the album returns straight back to it (the user's ask). From song
   // rows the album is a normal screen instead.
   const [albumOverPlayer, setAlbumOverPlayer] = useState<string | null>(null);
+  const [artistOverPlayer, setArtistOverPlayer] = useState<string | null>(null);
   const { current, expanded } = usePlayer();
 
   // ── screen history ────────────────────────────────────────────────────────
@@ -101,11 +108,13 @@ function AppShell() {
   // page (back arrow closes it and the player is right there again). Otherwise
   // it's a regular screen change, and Back returns to the page it came from.
   const albumScrollRef = useRef<HTMLDivElement | null>(null);
+  const artistScrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const onOpenAlbum = (e: Event) => {
       const id = (e as CustomEvent<string>).detail;
       if (!id) return;
       if (expandedRef.current) {
+        setArtistOverPlayer(null); // the overlays are exclusive — one page on top at a time
         setAlbumOverPlayer(id);
         scrollTop();
         return;
@@ -114,6 +123,28 @@ function AppShell() {
     };
     window.addEventListener(OPEN_ALBUM_EVENT, onOpenAlbum);
     return () => window.removeEventListener(OPEN_ALBUM_EVENT, onOpenAlbum);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── "Open artist" (Radio shelf — anywhere): the artist page is a normal
+  //    screen on the history stack, so its back arrow AND the Android
+  //    hardware Back both return where you came from. ──
+  useEffect(() => {
+    const onOpenArtist = (e: Event) => {
+      const name = (e as CustomEvent<string>).detail;
+      if (!name) return;
+      if (expandedRef.current) {
+        // from the FULL PLAYER: the artist page slides up ON TOP of the
+        // player (same as "Go to album") — closing it returns straight back
+        setAlbumOverPlayer(null); // the overlays are exclusive — one page on top at a time
+        setArtistOverPlayer(name);
+        scrollTop();
+        return;
+      }
+      navigate({ name: "artist", id: name });
+    };
+    window.addEventListener(OPEN_ARTIST_EVENT, onOpenArtist);
+    return () => window.removeEventListener(OPEN_ARTIST_EVENT, onOpenArtist);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -128,6 +159,17 @@ function AppShell() {
     albumScrollRef.current?.scrollTo({ top: 0 });
     return () => unregisterBackHandler("album-overlay");
   }, [albumOverPlayer]);
+
+  // same for the artist-over-player overlay
+  useEffect(() => {
+    if (!artistOverPlayer) return;
+    registerBackHandler("artist-overlay", 30, () => {
+      setArtistOverPlayer(null);
+      return true;
+    });
+    artistScrollRef.current?.scrollTo({ top: 0 });
+    return () => unregisterBackHandler("artist-overlay");
+  }, [artistOverPlayer]);
 
   const searchFor = (q: string) => {
     setSearchSeed({ q, n: Date.now() });
@@ -156,11 +198,14 @@ function AppShell() {
                 <LibraryScreen
                   onOpenLiked={() => navigate({ name: "playlist", id: "liked" })}
                   onOpenPlaylist={(id) => navigate({ name: "playlist", id })}
+                  onOpenDownloads={() => navigate({ name: "downloads" })}
                 />
               )}
               {screen.name === "playlist" &&
                 (screen.id === "liked" ? <LikedView onBack={goBack} /> : <UserPlaylistView id={screen.id} onBack={goBack} />)}
               {screen.name === "album" && <AlbumView id={screen.id} onBack={goBack} />}
+              {screen.name === "artist" && <ArtistView name={screen.id} onBack={goBack} />}
+              {screen.name === "downloads" && <DownloadsView onBack={goBack} />}
             </div>
           </div>
         </main>
@@ -200,6 +245,31 @@ function AppShell() {
             <div ref={albumScrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 pt-5 sm:px-6">
               <div className="mx-auto max-w-6xl pb-[calc(env(safe-area-inset-bottom)+40px)]">
                 <AlbumView id={albumOverPlayer} onBack={() => setAlbumOverPlayer(null)} />
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* "Go to artist" opened from the full player — mirrors the album
+          overlay: a separate page OVER the player (z-55); its back arrow
+          (or hardware back) closes it and the player is exactly where it
+          was. */}
+      <AnimatePresence>
+        {artistOverPlayer && (
+          <motion.div
+            key="artist-over-player"
+            initial={{ y: "100%" }}
+            animate={{ y: 0 }}
+            exit={{ y: "100%" }}
+            transition={{ type: "spring", damping: 30, stiffness: 300 }}
+            className="fixed inset-0 z-[55] flex flex-col overflow-hidden bg-[var(--bg)] text-foreground"
+            role="dialog"
+            aria-label="Artist"
+          >
+            <div ref={artistScrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 pt-5 sm:px-6">
+              <div className="mx-auto max-w-6xl pb-[calc(env(safe-area-inset-bottom)+40px)]">
+                <ArtistView name={artistOverPlayer} onBack={() => setArtistOverPlayer(null)} />
               </div>
             </div>
           </motion.div>

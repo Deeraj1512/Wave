@@ -28,4 +28,6 @@ export type Screen =
   | { name: "search" }
   | { name: "library" }
   | { name: "playlist"; id: string }
-  | { name: "album"; id: string }; // "Go to album" — the album page, openable from anywhere
+  | { name: "album"; id: string } // "Go to album" — the album page, openable from anywhere
+  | { name: "artist"; id: string } // artist page — the artist's song list (Radio shelf taps here)
+  | { name: "downloads" }; // Downloads — songs saved on-device, playable offline

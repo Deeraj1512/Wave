@@ -27,6 +27,10 @@ export interface NativeMediaMeta {
   /** Current playback position in SECONDS. Android extrapolates the bar between
    *  pushes (speed 1.0), so one push per play/pause/seek/track-change is enough. */
   position?: number;
+  /** Lock-screen shuffle button state (true = on). */
+  shuffle?: boolean;
+  /** Lock-screen loop button state: 0 = off · 1 = loop all · 2 = loop one. */
+  repeat?: number;
 }
 
 type WaveAudioPlugin = {
@@ -45,6 +49,11 @@ type CapShape = {
 let serviceStarted = false;
 let permissionAsked = false;
 let lastMeta: NativeMediaMeta | null = null;
+// Latest lock-screen mode-button state + audible flag — EVERY update payload
+// carries them, so the native card's shuffle/loop buttons can never drift away
+// from what the in-app UI shows.
+let modes = { shuffle: false, repeat: 0 };
+let lastPlaying = false;
 
 function cap(): CapShape | undefined {
   if (typeof window === "undefined") return undefined;
@@ -68,6 +77,7 @@ export function notifyPlayState(
 ): void {
   const p = plugin();
   if (!p) return;
+  lastPlaying = playing;
   try {
     if (playing) {
       p.start?.();
@@ -88,6 +98,8 @@ export function notifyPlayState(
         album: lastMeta?.album,
         cover: lastMeta?.cover,
         playing: true,
+        shuffle: modes.shuffle,
+        repeat: modes.repeat,
         position: snap?.position,
         duration: snap?.duration,
       });
@@ -98,6 +110,8 @@ export function notifyPlayState(
         album: lastMeta?.album,
         cover: lastMeta?.cover,
         playing: false,
+        shuffle: modes.shuffle,
+        repeat: modes.repeat,
         position: snap?.position,
         duration: snap?.duration ?? lastMeta?.duration,
       });
@@ -124,6 +138,9 @@ export function notifyNativeMedia(meta: NativeMediaMeta | null): void {
       return;
     }
     lastMeta = meta;
+    if (meta.playing) lastPlaying = true;
+    if (meta.shuffle !== undefined) modes.shuffle = meta.shuffle;
+    if (meta.repeat !== undefined) modes.repeat = meta.repeat;
     if (!serviceStarted) {
       if (!meta.playing) return; // never spawn the service for a paused push
       p.start?.();
@@ -137,7 +154,11 @@ export function notifyNativeMedia(meta: NativeMediaMeta | null): void {
       }
       serviceStarted = true;
     }
-    p.update?.(meta);
+    p.update?.({
+      ...meta,
+      shuffle: meta.shuffle ?? modes.shuffle,
+      repeat: meta.repeat ?? modes.repeat,
+    });
   } catch {
     /* the background service is an enhancement — never break playback over it */
   }
@@ -180,8 +201,35 @@ export function notifyNativeProgress(position: number, duration: number): void {
       album: lastMeta.album,
       cover: lastMeta.cover,
       playing: lastMeta.playing,
+      shuffle: modes.shuffle,
+      repeat: modes.repeat,
       position,
       duration: duration > 0 ? duration : undefined,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Push the lock-screen mode buttons (shuffle on/off, loop off/all/one) after an
+ * in-app toggle. Deliberately sends NO position/duration — the card's seek bar
+ * keeps its own extrapolation and must not rewind. While no card exists yet the
+ * state is only remembered: it rides along on every later update push instead.
+ */
+export function notifyNativeModes(shuffle: boolean, repeat: number): void {
+  modes = { shuffle, repeat };
+  const p = plugin();
+  if (!p || !serviceStarted || !lastMeta) return;
+  try {
+    p.update?.({
+      title: lastMeta.title,
+      artist: lastMeta.artist,
+      album: lastMeta.album,
+      cover: lastMeta.cover,
+      playing: lastPlaying,
+      shuffle,
+      repeat,
     });
   } catch {
     /* best-effort */
