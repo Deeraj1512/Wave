@@ -256,6 +256,13 @@ function familiarBoost(pool: Track[]): Track[] {
   }
 }
 
+/**
+ * REMOVED `progress` from this interface on purpose: progress ticks 1×/sec, and
+ * a main-context tick re-renders EVERY usePlayer() consumer (every SongCard,
+ * TrackRow, shelf, screen) every second while music plays — the feed-scroll
+ * jank on phones. Progress now rides ProgressCtx; only the seek bars and
+ * clocks subscribe via useProgress().
+ */
 interface PlayerState {
   current: Track | null;
   /** merged physical queue: manual + context + radio layers (see QTrack.layer) */
@@ -270,7 +277,6 @@ interface PlayerState {
   setRadioMode: (m: RadioMode) => void;
   radioLoading: boolean;
   isPlaying: boolean;
-  progress: number; // seconds
   expanded: boolean;
   shuffle: boolean;
   /** 0 = off · 1 = loop all · 2 = loop one (RepeatMode) */
@@ -319,6 +325,19 @@ interface PlayerState {
 }
 
 const Ctx = createContext<PlayerState | null>(null);
+
+// ── progress rides its OWN low-frequency context ───────────────────────────
+// The main player context only changes on real playback events (song change,
+// queue op, play/pause, mode flip). Progress ticks ~1×/sec — if it rode the
+// main value, every card in the feed would re-render every second while music
+// plays. Only seek bars + time labels consume ticks, through useProgress();
+// everything else stays untouched between real events.
+const ProgressCtx = createContext(0);
+
+/** ~1Hz playback position in seconds (0 = idle/unknown). Seek-bar + clock consumers only. */
+export function useProgress() {
+  return useContext(ProgressCtx);
+}
 
 export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const [queue, setQueue] = useState<QTrack[]>([]);
@@ -2100,7 +2119,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       setRadioMode,
       radioLoading,
       isPlaying,
-      progress,
       expanded,
       shuffle,
       repeat,
@@ -2135,15 +2153,21 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       restoreSound,
       toggleLike,
     }),
-    [current, queue, queueIndex, playingFrom, autoplay, radioMode, radioLoading, isPlaying, progress, expanded, shuffle, repeat, sleepTimer, volume, likedIds, likedTracks, engine, previewLimited, buffering, soundBlocked, playTrack, addToQueue, playNext, removeFromQueue, jumpTo, reorderUpcoming, clearManualQueue, reinsertQueueItem, startRadio, playRadio, togglePlay, next, prev, seek, setExpanded, toggleShuffle, cycleRepeat, setSleepTimer, toggleAutoplay, setRadioMode, setVolume, restoreSound, toggleLike]
+    [current, queue, queueIndex, playingFrom, autoplay, radioMode, radioLoading, isPlaying, expanded, shuffle, repeat, sleepTimer, volume, likedIds, likedTracks, engine, previewLimited, buffering, soundBlocked, playTrack, addToQueue, playNext, removeFromQueue, jumpTo, reorderUpcoming, clearManualQueue, reinsertQueueItem, startRadio, playRadio, togglePlay, next, prev, seek, setExpanded, toggleShuffle, cycleRepeat, setSleepTimer, toggleAutoplay, setRadioMode, setVolume, restoreSound, toggleLike]
   );
 
   return (
     <Ctx.Provider value={value}>
-      {children}
-      {/* hidden real-audio element (direct engine) */}
-      <audio ref={audioRef as any} hidden />
-      {/* hidden YouTube IFrame (embed engine) is created imperatively by ytEmbed */}
+      {/* progress OUTSIDE the main provider value: a tick re-renders only the
+          useProgress() consumers (seek bars, clocks) — never the feed. children
+          are referentially stable across ticks, so React bails out of the whole
+          subtree except the ProgressCtx consumers. */}
+      <ProgressCtx.Provider value={progress}>
+        {children}
+        {/* hidden real-audio element (direct engine) */}
+        <audio ref={audioRef as any} hidden />
+        {/* hidden YouTube IFrame (embed engine) is created imperatively by ytEmbed */}
+      </ProgressCtx.Provider>
     </Ctx.Provider>
   );
 }

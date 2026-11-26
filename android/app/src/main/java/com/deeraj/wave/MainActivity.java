@@ -5,6 +5,7 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
+import android.webkit.WebView;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -34,6 +35,17 @@ public class MainActivity extends BridgeActivity {
         // Pull-to-refresh is Wave's own JS gesture (PullToRefresh.tsx) — kill the
         // WebView's native overscroll stretch/glow so it is the only response.
         bridge.getWebView().setOverScrollMode(View.OVER_SCROLL_NEVER);
+        // Native-feel guarantee for a music app: the WebView renderer runs at
+        // FULL priority even while Wave is backgrounded (audio plays on through
+        // the foreground service). Without this, Android throttles the renderer
+        // in the background and RAM-tight phones kill it outright — returning
+        // to Wave then meant a frozen-frame repaint or a full app reload.
+        // RENDERER_PRIORITY_IMPORTANT + waivedWhenNotVisible=false = instant
+        // resume, renderer survives the whole song. (API 26+; minSdk is 23.)
+        if (Build.VERSION.SDK_INT >= 26) {
+            bridge.getWebView().setRendererPriorityPolicy(
+                    WebView.RENDERER_PRIORITY_IMPORTANT, false);
+        }
         // The media-notification card routes its transport buttons into the web
         // player through window.__waveMediaAction on this WebView.
         MediaPlaybackService.setWebView(bridge.getWebView());

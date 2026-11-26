@@ -6,7 +6,7 @@ import {
   AudioLines, ChevronDown, ChevronUp, ExternalLink, GripVertical, Heart, ListMusic, ListPlus, ListStart, MoreVertical, Music, Pause, Play, Radio, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Trash2, Volume2, VolumeX, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { usePlayer, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
+import { usePlayer, useProgress, ytLinkFor, radioModeLabel, type QTrack, type RadioMode } from "@/lib/player";
 import { IS_NATIVE } from "@/lib/api";
 import { getPreferredQuality, setPreferredQuality, subscribeQuality, type PreferredQuality } from "@/lib/yt/resolve";
 import { registerBackHandler } from "@/lib/backStack";
@@ -217,10 +217,11 @@ function QualityChip({ className }: { className?: string }) {
 
 export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQueuePanel: () => void; queuePanelOpen: boolean }) {
   const {
-    current, isPlaying, progress, togglePlay, next, prev, setExpanded, likedIds, toggleLike, seek,
+    current, isPlaying, togglePlay, next, prev, setExpanded, likedIds, toggleLike, seek,
     shuffle, toggleShuffle, repeat, cycleRepeat, volume, setVolume, engine, buffering, soundBlocked,
     restoreSound, queue, queueIndex,
   } = usePlayer();
+  const progress = useProgress();
   const { toast } = useToast();
   const cover = useCover(current);
   const pal = useDominantPalette(current);
@@ -437,10 +438,11 @@ export function MiniPlayer({ onToggleQueuePanel, queuePanelOpen }: { onToggleQue
 // ─────────────────────────────────────────────────────────────────────────────
 export function FullPlayer() {
   const {
-    current, isPlaying, progress, expanded, setExpanded, togglePlay, next, prev,
+    current, isPlaying, expanded, setExpanded, togglePlay, next, prev,
     seek, shuffle, toggleShuffle, repeat, cycleRepeat, likedIds, toggleLike, volume, setVolume, queue, queueIndex,
     soundBlocked, restoreSound, engine,
   } = usePlayer();
+  const progress = useProgress();
   const cover = useCover(current);
   const pal = useDominantPalette(current);
   // carousel neighbors — queue order IS play order (shuffle reorders the queue

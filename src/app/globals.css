@@ -58,6 +58,24 @@ body {
   background: var(--bg);
 }
 
+/* ── WebView smoothness kit (Android 13+ APK) ────────────────────────────── */
+
+/* No gray tap flash — touches respond like a native app (the ripple surfaces
+   that DO want feedback style their own highlight) */
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Long vertical track lists (albums, playlists, liked songs, search results):
+   Chromium skips layout + paint for rows scrolled out of view, so a 200-row
+   playlist scrolls as cheap as a 20-row one on mid-range phones. `auto 64px`
+   keeps the scrollbar stable (a row is ≈64px before its first render; after
+   that the browser remembers each row's real height). */
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 64px;
+}
+
 body {
   font-family: Roboto, ui-sans-serif, system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;

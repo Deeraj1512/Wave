@@ -46,7 +46,7 @@ export function TrackRow({ track, index, context, showAlbum = true, label, radio
   return (
     <div
       className={cn(
-        "group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors sm:gap-4 sm:px-3",
+        "cv-row group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors sm:gap-4 sm:px-3",
         active ? "bg-surface-2" : "hover:bg-surface-2/70"
       )}
     >

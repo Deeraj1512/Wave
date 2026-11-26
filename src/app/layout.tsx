@@ -15,6 +15,9 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
+  // pinch/double-tap zoom off — a music app never zooms its chrome, and this
+  // kills the WebView's zoom-gesture hit-testing on every scroll (native feel)
+  userScalable: false,
 };
 
 export default function RootLayout({

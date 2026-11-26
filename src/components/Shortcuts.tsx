@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { usePlayer } from "@/lib/player";
+import { usePlayer, useProgress } from "@/lib/player";
 import type { Screen } from "@/lib/types";
 
 const GROUPS: Array<{ title: string; items: Array<[string, string]> }> = [
@@ -65,6 +65,14 @@ export function ShortcutsLayer({
   useEffect(() => {
     pRef.current = p;
   });
+  // progress lives in its own ~1Hz context (keeps the feed from re-rendering on
+  // every tick) — mirror it through the same latest-ref pattern: seek keys read
+  // the freshest second at press time without re-attaching the listener.
+  const progress = useProgress();
+  const progressRef = useRef(progress);
+  useEffect(() => {
+    progressRef.current = progress;
+  });
   const [helpOpen, setHelpOpen] = useState(false);
 
   // top-bar keyboard icon can open the help dialog
@@ -95,19 +103,19 @@ export function ShortcutsLayer({
           break;
         case "ArrowRight":
           e.preventDefault();
-          P.seek(clamp(P.progress + 5));
+          P.seek(clamp(progressRef.current + 5));
           break;
         case "ArrowLeft":
           e.preventDefault();
-          P.seek(clamp(P.progress - 5));
+          P.seek(clamp(progressRef.current - 5));
           break;
         case "j":
         case "J":
-          P.seek(clamp(P.progress - 10));
+          P.seek(clamp(progressRef.current - 10));
           break;
         case "l":
         case "L":
-          P.seek(clamp(P.progress + 10));
+          P.seek(clamp(progressRef.current + 10));
           break;
         case "n":
         case "N":
