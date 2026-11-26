@@ -54,8 +54,10 @@ import java.util.concurrent.Executors;
  *
  * Started from JS via the WaveAudio plugin (start/stop/update). The card survives
  * pause (YTM behavior — the button flips to ▶ so playback resumes from the shade);
- * it is dismissed by JS pushing meta=null (queue emptied) or the user swiping it
- * while paused.
+ * it goes away when JS pushes meta=null (queue emptied) or the user swipes it in
+ * the shade / lock screen — which ALSO stops the music: the swipe arrives as the
+ * notification's delete intent plus, on Android 13+, a STOP media-button event
+ * into the session, and both land in dismissCard().
  */
 public class MediaPlaybackService extends Service {
     private static final String CHANNEL_ID = "wave_playback";
@@ -76,6 +78,10 @@ public class MediaPlaybackService extends Service {
     static final String ACTION_UPDATE = "com.deeraj.wave.media.UPDATE";
     static final String ACTION_SHUFFLE = "com.deeraj.wave.media.SHUFFLE";
     static final String ACTION_LOOP = "com.deeraj.wave.media.LOOP";
+    /** Fired by the notification's delete intent when the user swipes the card
+     *  away in the shade / lock screen. Ends playback AND the service — unlike
+     *  ACTION_PAUSE, which must keep the paused card alive (YTM behavior). */
+    static final String ACTION_DISMISSED = "com.deeraj.wave.media.DISMISSED";
     /** Android 13+ draws the lock-screen card's buttons from the MediaSession's
      *  PlaybackState and IGNORES notification actions — card taps come back as
      *  these custom actions (handled in onCustomAction). Own namespace, distinct
@@ -107,6 +113,15 @@ public class MediaPlaybackService extends Service {
      *  resume audible) apart from a fresh open after a kill (service dead →
      *  restore PAUSED; the song waits for the user's ▶, never auto-plays). */
     static volatile boolean playingNow = false;
+
+    /** True from the moment the user swipes the card away (shade / lock screen)
+     *  until playback is genuinely audible again. Static ON PURPOSE: the
+     *  WebView player's paused UPDATE echo can still be in flight after
+     *  stopSelf(), and a fresh service instance must drop it too — otherwise
+     *  the echo resurrects the card the user just swiped off. The plugin reads
+     *  this to drop the echo at the source; onStartCommand re-arms it the
+     *  moment a playing state genuinely arrives. */
+    static volatile boolean dismissed = false;
 
     private MediaSessionCompat session;
     private PowerManager.WakeLock wakeLock;
@@ -203,6 +218,17 @@ public class MediaPlaybackService extends Service {
                 dispatch("pause");
             }
 
+            // Android 13+ reports "the user swiped the media card away" (shade
+            // or lock screen — the card is swipeable there even while playing)
+            // as a STOP media-button event routed INTO the session. Without
+            // this override the default handling was a silent no-op: the music
+            // kept playing with no card left to control it. A Bluetooth or
+            // assistant stop key lands here too — stop means stop.
+            @Override
+            public void onStop() {
+                dismissCard();
+            }
+
             @Override
             public void onSkipToNext() {
                 dispatch("next");
@@ -259,6 +285,43 @@ public class MediaPlaybackService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
+
+        // THE USER SWIPED THE CARD AWAY (shade or lock screen). Arrives as the
+        // notification's delete intent — and on Android 13+ as the session's
+        // onStop() above. Stop the music, end the service, re-post nothing: a
+        // swipe must STICK. (The old wiring reused ACTION_PAUSE here, which is
+        // indistinguishable from a pause-button tap — onStartCommand then
+        // rebuilt and re-posted the very card it was "dismissing".)
+        if (ACTION_DISMISSED.equals(action)) {
+            dismissCard();
+            return START_NOT_STICKY;
+        }
+
+        // Backstop: a paused UPDATE echo that slipped past the plugin's
+        // dismissed-guard (an intent already in flight when the swipe landed)
+        // must never resurrect the card the user just swiped. startForeground
+        // first — this delivery can carry the startForegroundService contract.
+        if (ACTION_UPDATE.equals(action) && dismissed
+                && !intent.getBooleanExtra(EXTRA_PLAYING, false)) {
+            Notification nEcho = buildNotification();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, nEcho,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(NOTIFICATION_ID, nEcho);
+            }
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        // Re-arm the dismissal flag the moment playback is genuinely audible
+        // again — it only guards the swipe-echo window, never new sessions.
+        if (ACTION_UPDATE.equals(action)
+                ? intent.getBooleanExtra(EXTRA_PLAYING, false)
+                : ACTION_PLAY.equals(action)) {
+            dismissed = false;
+        }
+
         if (ACTION_PLAY.equals(action)) {
             dispatch("play");
         } else if (ACTION_PAUSE.equals(action)) {
@@ -456,6 +519,19 @@ public class MediaPlaybackService extends Service {
         }
     }
 
+    /** The user swiped the card away in the shade / lock screen: stop the
+     *  music in the WebView player and end the service. Re-posts nothing — the
+     *  swipe must stick. Idempotent: the dismissal can arrive twice (the
+     *  delete intent AND the Android 13+ session STOP event, in either order).
+     *  Must run on the main thread. */
+    private void dismissCard() {
+        dismissed = true;   // first — drops the paused echo the pause below triggers
+        playing = false;
+        playingNow = false;
+        dispatch("pause");  // stop the audio element (no-op if already paused)
+        stopSelf();         // onDestroy releases session, wake lock, receiver
+    }
+
     private PendingIntent actionPi(String action, int req) {
         Intent i = new Intent(this, MediaPlaybackService.class).setAction(action);
         return PendingIntent.getService(this, req, i,
@@ -468,8 +544,11 @@ public class MediaPlaybackService extends Service {
                 ? PendingIntent.getActivity(this, REQ_OPEN, open,
                         PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
                 : null;
-        // swiping a paused card away pauses playback in the player too
-        PendingIntent deletePi = actionPi(ACTION_PAUSE, REQ_DELETE);
+        // swiping the card away (shade / lock screen) stops playback and ends
+        // the service — see dismissCard(). Wiring the delete intent to
+        // ACTION_PAUSE was the old bug: indistinguishable from a pause-button
+        // tap, so the service re-posted the card the user had just dismissed.
+        PendingIntent deletePi = actionPi(ACTION_DISMISSED, REQ_DELETE);
         String subtitle = album.isEmpty() ? artist : artist + " · " + album;
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_media_play)

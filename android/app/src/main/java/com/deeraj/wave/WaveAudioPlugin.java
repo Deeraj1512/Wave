@@ -57,13 +57,18 @@ public class WaveAudioPlugin extends Plugin {
      * Push card content: title, artist, album, cover URL, playing state. While
      * paused the service keeps the card alive (▶ button), so updates flow even
      * when nothing is audible — but we never spawn the service just to show a
-     * paused card the user never started playing.
+     * paused card the user never started playing, and a paused push never
+     * resurrects a card the user just swiped away.
      */
     @PluginMethod
     public void update(PluginCall call) {
         Context ctx = getContext();
         boolean playing = Boolean.TRUE.equals(call.getBoolean("playing"));
-        if (!MediaPlaybackService.running && !playing) {
+        // No card to update: the service is dead, or the user just swiped the
+        // card away and the WebView player's paused echo is still in flight —
+        // an UPDATE now would resurrect the card the user just dismissed.
+        if ((!MediaPlaybackService.running && !playing)
+                || (MediaPlaybackService.dismissed && !playing)) {
             call.resolve();
             return;
         }
