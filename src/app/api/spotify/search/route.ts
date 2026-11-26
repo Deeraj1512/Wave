@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { spotifyApi, spotifyConfigured } from "@/lib/spotify/serverAuth";
-import { matchSpotifyBatch } from "@/lib/spotify/serverMatch";
 import type { SpTrackHit } from "@/lib/spotify/types";
 
 export const runtime = "nodejs";
@@ -9,13 +8,15 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/spotify/search?q=&limit=&market=
  *
- * One Spotify search (type=track,artist,album) + the matcher. Tracks come
- * back pre-matched to playable videoIds (videoId=null when the matcher had
- * no confident candidate — the UI renders those dimmed). Artists and albums
- * are plain Spotify entities: artists open the EXISTING per-artist page by
- * name, albums open the EXISTING YTM album page via entity matching, so no
- * parallel Spotify pages exist and the app's language/feed machinery keeps
- * applying everywhere.
+ * METADATA-ONLY Spotify search (type=track,artist,album). The route is a pure
+ * proxy: the client secret stays in server env, and matching to playable
+ * videoIds happens CLIENT-side (src/lib/spotify/match.ts → the app's own
+ * originals-only YTM chain). Tracks ship with videoId=null and the app fills
+ * them before rendering — matched ones play, unmatched render dimmed.
+ * Artists and albums are plain Spotify entities: artists open the EXISTING
+ * per-artist page by name, albums open the EXISTING YTM album page via entity
+ * matching, so no parallel Spotify pages exist and the app's language/feed
+ * machinery keeps applying everywhere.
  */
 
 interface SpApiImage { url: string; width: number; height: number }
@@ -93,16 +94,7 @@ export async function GET(req: NextRequest) {
     }));
 
     const spTracks = (data.tracks?.items ?? []).slice(0, limit);
-    const matches = await matchSpotifyBatch(
-      spTracks.map((t) => ({
-        id: t.id,
-        name: t.name,
-        durationMs: t.duration_ms,
-        artists: t.artists.map((a) => a.name),
-      }))
-    );
-
-    const tracks: SpTrackHit[] = spTracks.map((t, i) => ({
+    const tracks: SpTrackHit[] = spTracks.map((t) => ({
       spotifyId: t.id,
       title: t.name,
       artist: t.artists.map((a) => a.name).join(", "),
@@ -111,8 +103,8 @@ export async function GET(req: NextRequest) {
       image: bestImage(t.album?.images, 640),
       popularity: t.popularity ?? 0,
       year: t.album?.release_date?.slice(0, 4),
-      videoId: matches[i]?.videoId ?? null,
-      confidence: matches[i]?.confidence ?? 0,
+      videoId: null, // matched client-side (match.ts) — this route stays a pure proxy
+      confidence: 0,
     }));
 
     const out = { configured: true, tracks, artists, albums };

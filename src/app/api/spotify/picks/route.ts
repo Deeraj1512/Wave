@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isGated, spotifyApi, spotifyConfigured } from "@/lib/spotify/serverAuth";
-import { matchSpotifyBatch, type SpMatchInput } from "@/lib/spotify/serverMatch";
 import { artistIdByName, validGenreSeeds } from "@/lib/spotify/serverResolve";
 import type { SpTrackHit } from "@/lib/spotify/types";
 
@@ -20,9 +19,11 @@ export const dynamic = "force-dynamic";
  *   1. genre seeds are validated against /available-genre-seeds first; if
  *      THAT fails, recommendations almost surely would too (skip to fallback).
  *   2. fallback builder — popularity-ranked search per seed artist (or genre
- *      term), deduped by title+artist, matched to videoIds like everywhere
- *      else. "Picks" works in dev mode, and upgrades automatically to real
- *      recommendations when Extended Quota is granted.
+ *      term), deduped by title+artist. "Picks" works in dev mode, and
+ *      upgrades automatically to real recommendations when Extended Quota is
+ *      granted.
+ * Matching to playable videoIds happens CLIENT-side (match.ts); this route
+ * ships metadata only (videoId=null).
  */
 
 interface SpApiImage { url: string; width: number; height: number }
@@ -43,11 +44,7 @@ function bestImage(images: SpApiImage[] | undefined, want: number): string | und
   return (sorted.find((i) => (i.width || 0) >= want) ?? sorted[sorted.length - 1]).url;
 }
 
-function toInput(t: SpApiTrack): SpMatchInput {
-  return { id: t.id, name: t.name, durationMs: t.duration_ms, artists: t.artists.map((a) => a.name) };
-}
-
-function toHit(t: SpApiTrack, videoId: string | null, confidence: number): SpTrackHit {
+function toHit(t: SpApiTrack): SpTrackHit {
   return {
     spotifyId: t.id,
     title: t.name,
@@ -57,8 +54,8 @@ function toHit(t: SpApiTrack, videoId: string | null, confidence: number): SpTra
     image: bestImage(t.album?.images, 640),
     popularity: t.popularity ?? 0,
     year: t.album?.release_date?.slice(0, 4),
-    videoId,
-    confidence,
+    videoId: null, // matched client-side (match.ts) — this route stays a pure proxy
+    confidence: 0,
   };
 }
 
@@ -108,9 +105,7 @@ export async function GET(req: NextRequest) {
       try {
         const data = await spotifyApi<{ tracks: SpApiTrack[] }>(`/recommendations?${p.toString()}`);
         const items = (data.tracks ?? []).filter((t) => t && t.id).slice(0, limit);
-        const matches = await matchSpotifyBatch(items.map(toInput));
-        const tracks = items.map((t, i) => toHit(t, matches[i]?.videoId ?? null, matches[i]?.confidence ?? 0));
-        return NextResponse.json({ available: true, source: "recommendations", tracks });
+        return NextResponse.json({ available: true, source: "recommendations", tracks: items.map(toHit) });
       } catch (e) {
         if (!isGated(e)) {
           // transport-level failure — surface the fallback anyway, no error to the user
@@ -152,9 +147,7 @@ export async function GET(req: NextRequest) {
     if (items.length === 0) {
       return NextResponse.json({ available: false, source: "fallback", tracks: [], reason: "no seeds matched" });
     }
-    const matches = await matchSpotifyBatch(items.map(toInput));
-    const tracks = items.map((t, i) => toHit(t, matches[i]?.videoId ?? null, matches[i]?.confidence ?? 0));
-    return NextResponse.json({ available: true, source: "fallback", tracks });
+    return NextResponse.json({ available: true, source: "fallback", tracks: items.map(toHit) });
   } catch (e) {
     return NextResponse.json(
       {

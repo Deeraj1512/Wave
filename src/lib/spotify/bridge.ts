@@ -2,21 +2,44 @@
  * Client bridge to the Spotify layer (Phase 1 + Phase 3).
  *
  * Every call hits /api/spotify/* — on the WEB runtime same-origin, on the
- * APK through the deployed site's bridge (see config.ts). The bridge returns
- * entities ALREADY matched to videoIds; this layer only converts them into
- * the app's Track shape so playback/queue/radio/likes/history run unchanged.
+ * APK through the Cloudflare Worker bridge deployed by GitHub Actions (see
+ * config.ts). The bridge is a METADATA-ONLY Spotify proxy (the client secret
+ * lives in Worker env vars only); matching to playable videoIds happens HERE,
+ * client-side, through match.ts → the app's own originals-only YTM chain —
+ * the same path the search tab uses. Results convert into the app's Track
+ * shape so playback/queue/radio/likes/history run unchanged.
  *
  * The availability probe is cached 10 minutes (session-lifetime cost of one
  * status call): with no credentials configured the UI hides every Spotify
  * surface instead of showing errors — Wave stays a pure YTM app until the
- * owner adds the env vars.
+ * owner deploys the bridge.
  */
 
 import { colorFor } from "../data";
 import { detectTrackLang, guessLangFromWords, inferLiveLang } from "../langs";
 import type { Track } from "../types";
 import { spotifyBridgeBase } from "./config";
+import { matchSpotifyBatch } from "./match";
+import type { SpMatchInput } from "./match";
 import type { SpPicksResult, SpRelatedResult, SpSearchResult, SpTrackHit } from "./types";
+
+/** Fill videoIds into metadata-only hits (client-side matcher, session-cached). */
+async function attachMatches(hits: SpTrackHit[]): Promise<SpTrackHit[]> {
+  const pending = hits.filter((t) => !t.videoId);
+  if (pending.length === 0) return hits;
+  const inputs: SpMatchInput[] = pending.map((t) => ({
+    id: t.spotifyId,
+    name: t.title,
+    durationMs: t.durationSec * 1000,
+    artists: t.artist.split(", "),
+  }));
+  const matches = await matchSpotifyBatch(inputs);
+  const byId = new Map(pending.map((t, i) => [t.spotifyId, matches[i]]));
+  return hits.map((t) => {
+    const m = byId.get(t.spotifyId);
+    return m && !t.videoId ? { ...t, videoId: m.videoId, confidence: m.confidence } : t;
+  });
+}
 
 let probe: { at: number; ok: boolean } | null = null;
 
@@ -41,7 +64,10 @@ export async function spotifySearch(q: string, signal?: AbortSignal): Promise<Sp
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`spotify search ${res.status}`);
-  return (await res.json()) as SpSearchResult;
+  const data = (await res.json()) as SpSearchResult;
+  if (!data.configured) return data;
+  data.tracks = await attachMatches(data.tracks);
+  return data;
 }
 
 export async function spotifyPicks(
@@ -56,7 +82,9 @@ export async function spotifyPicks(
   try {
     const res = await fetch(`${spotifyBridgeBase()}/picks?${p.toString()}`, { cache: "no-store" });
     if (!res.ok) throw new Error(`picks ${res.status}`);
-    return (await res.json()) as SpPicksResult;
+    const data = (await res.json()) as SpPicksResult;
+    if (data.available) data.tracks = await attachMatches(data.tracks);
+    return data;
   } catch (e) {
     return {
       available: false,
