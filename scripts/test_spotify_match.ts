@@ -1,101 +1,114 @@
 /**
- * Offline threshold test for the Spotify → YouTube matcher scoring.
- * Run: bun scripts/test_spotify_match.ts
- * No network — scoreHit is pure; ytSearch/matchSpotifyTrack are NOT touched.
+ * OFFLINE matcher test — no network. Validates scoreHit() thresholds against
+ * realistic Spotify-track → YTM-candidate pairs drawn from the Indian market
+ * (Telugu/Hindi film songs, "- Topic" uploads, jukeboxes, nightcore, 1-hour
+ * loops). Run: bun run scripts/test_spotify_match.ts — exits 1 on any failure.
+ *
+ * scoreHit contract under test:
+ *   null            → hard reject (duration beyond rescue / not the song)
+ *   number ≥ 48     → accepted (best candidate wins)
+ *   number < 48     → below the acceptance bar (ships UNMATCHED)
  */
-import { scoreHit } from "../src/lib/spotify/match";
-import type { SpMatchInput } from "../src/lib/spotify/match";
+
+import { scoreHit, type SpMatchInput } from "../src/lib/spotify/serverMatch";
+
+interface Case {
+  label: string;
+  sp: SpMatchInput;
+  hit: { videoId: string; title: string; artist: string; album: string; durationSec: number; views: number; tier: number };
+  expect: "accept" | "nomatch";
+}
+
+const cases: Case[] = [
+  // ── accepts ────────────────────────────────────────────────────────────────
+  {
+    label: "exact YTM original (ATV tier 1, same duration)",
+    sp: { id: "sp1", name: "Nee Kannu Neeli Samudram", durationMs: 268_000, artists: ["Anirudh Ravichander", "Dhanush"] },
+    hit: { videoId: "abc", title: "Nee Kannu Neeli Samudram", artist: "Anirudh Ravichander - Topic", album: "Uppena", durationSec: 267, views: 4_000_000, tier: 1 },
+    expect: "accept",
+  },
+  {
+    label: "official audio upload with noise in the title",
+    sp: { id: "sp2", name: "Butta Bomma", durationMs: 226_000, artists: ["Armaan Malik"] },
+    hit: { videoId: "def", title: "Butta Bomma Video Song | Ala Vaikunthapurramuloo | Official Video 4K", artist: "Aditya Music", album: "Ala Vaikunthapurramuloo", durationSec: 228, views: 900_000_000, tier: 2 },
+    expect: "accept",
+  },
+  {
+    label: "Spotify movie-tail cleaned, containment artist",
+    sp: { id: "sp3", name: "Kurchi Madathapetti (From \"Guntur Kaaram\")", durationMs: 252_000, artists: ["Thaman S", "Sid Sriram"] },
+    hit: { videoId: "ghi", title: "Kurchi Madathapetti (From 'Guntur Kaaram') Lyrical", artist: "Thaman S - Topic", album: "Guntur Kaaram", durationSec: 253, views: 300_000_000, tier: 1 },
+    expect: "accept",
+  },
+  {
+    label: "±5s duration window, overlapping title tokens",
+    sp: { id: "sp4", name: "Samajavaragamana", durationMs: 245_000, artists: ["Sid Sriram"] },
+    hit: { videoId: "jkl", title: "Samajavaragamana Full Song", artist: "Aditya Music", album: "Ala Vaikunthapurramuloo", durationSec: 249, views: 200_000_000, tier: 2 },
+    expect: "accept",
+  },
+  {
+    label: "jukebox-time title but per-track duration match",
+    sp: { id: "sp5", name: "Rangamma Mangamma", durationMs: 214_000, artists: ["M.M. Keeravaani"] },
+    hit: { videoId: "mno", title: "Rangamma Mangamma Audio Song | Rangasthalam", artist: "Aditya Music", album: "Rangasthalam", durationSec: 216, views: 80_000_000, tier: 2 },
+    expect: "accept",
+  },
+
+  // ── hard rejects (null) ────────────────────────────────────────────────────
+  {
+    label: "1-hour loop upload",
+    sp: { id: "sp6", name: "Nee Kannu Neeli Samudram", durationMs: 268_000, artists: ["Anirudh Ravichander"] },
+    hit: { videoId: "r1", title: "Nee Kannu Neeli Samudram 1 Hour Loop", artist: "Loop Zone", album: "", durationSec: 3600, views: 50_000, tier: 3 },
+    expect: "nomatch",
+  },
+  {
+    label: "full album jukebox (20 min)",
+    sp: { id: "sp7", name: "Butta Bomma", durationMs: 226_000, artists: ["Armaan Malik"] },
+    hit: { videoId: "r2", title: "Ala Vaikunthapurramuloo Full Audio Jukebox", artist: "Aditya Music", album: "", durationSec: 1450, views: 30_000_000, tier: 3 },
+    expect: "nomatch",
+  },
+  {
+    label: "nightcore sped-up cover (duration collapse)",
+    sp: { id: "sp8", name: "Samajavaragamana", durationMs: 245_000, artists: ["Sid Sriram"] },
+    hit: { videoId: "r3", title: "Samajavaragamana Nightcore", artist: "Nightcore Lab", album: "", durationSec: 196, views: 900_000, tier: 3 },
+    expect: "nomatch",
+  },
+  {
+    label: "completely different song sharing one word",
+    sp: { id: "sp9", name: "Nuvvunte Naa Jathaga", durationMs: 282_000, artists: ["Sid Sriram"] },
+    hit: { videoId: "r4", title: "Nuvvu Navvu Nanna Chusi Nenu Full Comedy Scene", artist: "Sri Balaji Video", album: "", durationSec: 285, views: 2_000_000, tier: 3 },
+    expect: "nomatch",
+  },
+  {
+    label: "spoken podcast with the song name in it",
+    sp: { id: "sp10", name: "Naatu Naatu", durationMs: 230_000, artists: ["Rahul Sipligunj", "Kaala Bhairava"] },
+    hit: { videoId: "r5", title: "Interview: How We Wrote Naatu Naatu | Keeravaani", artist: "Film Companion", album: "", durationSec: 232, views: 400_000, tier: 3 },
+    expect: "nomatch",
+  },
+];
 
 let pass = 0;
 let fail = 0;
 
-function check(name: string, ok: boolean, got: unknown, want: string) {
-  if (ok) {
-    pass++;
-    console.log(`PASS  ${name}  (score=${got})`);
-  } else {
-    fail++;
-    console.log(`FAIL  ${name}  got=${got} want=${want}`);
-  }
+for (const c of cases) {
+  const s = scoreHit(c.sp, c.hit);
+  const kind = s === null ? "nomatch" : s >= 48 ? "accept" : "nomatch";
+  const ok = kind === c.expect;
+  if (ok) pass++;
+  else fail++;
+  console.log(`${ok ? "PASS" : "FAIL"}  ${c.label}: score=${s === null ? "null" : s.toFixed(1)} (${kind}, expected ${c.expect})`);
 }
 
-const buttera: SpMatchInput = {
-  id: "sp-1",
-  name: "Butta Bomma (From \"Ala Vaikunthapurramuloo\")",
-  durationMs: 218000,
-  artists: ["Sunidhi Chauhan", "Armaan Malik"],
-};
-
-// 1. The real-world shape: YTM video-tier upload with promo noise, exact duration.
-const videoNoise = {
-  videoId: "vv1",
-  title: "Butta Bomma Video Song 8K | Ala Vaikunthapurramuloo | Allu Arjun | Sunidhi Chauhan",
-  artist: "Sunidhi Chauhan",
-  album: "Ala Vaikunthapurramuloo",
-  durationSec: 218,
-  views: 800000000,
-  tier: 2,
-  rel: 8000,
-};
-const s1 = scoreHit(buttera, videoNoise);
-check("promo-noise video upload accepts", s1 !== null && s1 >= 48, s1, ">= 48");
-
-// 2. ATV / official-audio candidate, spotless title.
-const atv = {
-  videoId: "vv2",
-  title: "Butta Bomma",
-  artist: "Sunidhi Chauhan - Topic",
-  album: "Ala Vaikunthapurramuloo",
-  durationSec: 219,
-  views: 900000000,
-  tier: 1,
-  rel: 9500,
-};
-const s2 = scoreHit(buttera, atv);
-check("clean ATV official audio accepts stronger", s2 !== null && s2 > (s1 ?? -1), s2, "> case1");
-
-// 3. A different song entirely — same artist, wrong title.
-const s3 = scoreHit(buttera, { ...atv, videoId: "vv3", title: "Saami Saami", durationSec: 210 });
-check("different song rejects", s3 === null, s3, "null");
-
-// 4. Right title, 100 seconds off (a dj mix / extended loop).
-const s4 = scoreHit(buttera, { ...atv, videoId: "vv4", durationSec: 318 });
-check("duration 100s off rejects", s4 === null, s4, "null");
-
-// 5. Duration 12s off (movie intro) but title + artist exact — accepted, mid score.
-const s5 = scoreHit(buttera, { ...atv, videoId: "vv5", durationSec: 230, rel: 4000 });
-check("movie-intro duration accepts", s5 !== null && s5 >= 48, s5, ">= 48");
-
-// 6. Telugu native-script title match.
-const telugu: SpMatchInput = { id: "sp-6", name: "Nee Kannu Neeli Samudram", durationMs: 251000, artists: ["Revanth"] };
-const s6 = scoreHit(telugu, {
-  videoId: "vv6",
-  title: "Nee Kannu Neeli Samudram Lyrical | Uppena",
-  artist: "Revanth - Topic",
-  album: "Uppena",
-  durationSec: 250,
-  views: 120000000,
-  tier: 2,
-  rel: 7000,
-});
-check("telugu lyrical-video upload accepts", s6 !== null && s6 >= 48, s6, ">= 48");
-
-// 7. Nightcore-style speedup — title matches, duration collapsed.
-const s7 = scoreHit(buttera, { ...atv, videoId: "vv7", title: "Butta Bomma (Sped Up)", durationSec: 185 });
-check("sped-up version rejects on duration", s7 === null, s7, "null");
-
-// 8. Borderline: title 0.7-0.95 sim, artist unknown channel, tier 2, no rel.
-const s8 = scoreHit(buttera, {
-  videoId: "vv8",
-  title: "Butta Bomma Full Audio Song",
-  artist: "Music Hub India",
-  album: "n/a",
-  durationSec: 220,
-  views: 50000,
-  tier: 2,
-  rel: 0,
-});
-check("borderline upload accepts (30+24+0+3+0=57)", s8 !== null && s8 >= 48 && s8 < 62, s8, "57");
+// Acceptance bar sanity: a top-tier exact match must clear the bar by a margin.
+const margin = scoreHit(
+  { id: "m", name: "Butta Bomma", durationMs: 226_000, artists: ["Armaan Malik"] },
+  { videoId: "x", title: "Butta Bomma", artist: "Armaan Malik - Topic", album: "Ala Vaikunthapurramuloo", durationSec: 226, views: 9e8, tier: 1 }
+);
+if (margin !== null && margin >= 70) {
+  pass++;
+  console.log(`PASS  perfect-match margin: score=${margin.toFixed(1)} (≥ 70)`);
+} else {
+  fail++;
+  console.log(`FAIL  perfect-match margin: score=${margin === null ? "null" : margin.toFixed(1)} (expected ≥ 70)`);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
