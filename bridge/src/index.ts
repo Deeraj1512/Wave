@@ -10,8 +10,11 @@
  * app itself stays repo → Actions → APK.
  *
  * Endpoints (all GET, CORS open — the APK uses native HTTP anyway):
- *   /api/spotify/status   → { configured }           availability probe
- *   /api/spotify/search   → tracks/artists/albums    metadata only
+ *   /api/spotify/status   → { configured, clientId }   availability probe
+ *                           (clientId = the PUBLIC app id — the in-app PKCE
+ *                            login needs it and PKCE involves no secret)
+ *   /api/spotify/search   → tracks/artists/albums/playlists  metadata only
+ *   /api/spotify/playlist → one playlist page (metadata + track metadata)
  *   /api/spotify/picks    → Phase 3 recommendations  (gated → fallback lane)
  *   /api/spotify/related  → Phase 3 fans-also-like   (gated → available:false)
  *
@@ -192,6 +195,13 @@ interface SpApiAlbum {
   artists?: { name: string }[];
   images?: SpApiImage[];
 }
+interface SpApiPlaylist {
+  id: string;
+  name: string;
+  owner?: { display_name?: string };
+  tracks?: { total?: number };
+  images?: SpApiImage[];
+}
 
 function bestImage(images: SpApiImage[] | undefined, want: number): string | undefined {
   if (!images?.length) return undefined;
@@ -222,7 +232,7 @@ const SEARCH_TTL = 10 * 60 * 1000;
 async function handleSearch(url: URL): Promise<Response> {
   const q = url.searchParams.get("q")?.trim();
   if (!q) return json({ error: "missing q" }, 400);
-  if (!credentials()) return json({ configured: false, tracks: [], artists: [], albums: [] });
+  if (!credentials()) return json({ configured: false, tracks: [], artists: [], albums: [], playlists: [] });
   const market = url.searchParams.get("market") || "IN";
   const limit = Math.min(30, Math.max(1, parseInt(url.searchParams.get("limit") || "20", 10) || 20));
 
@@ -237,8 +247,9 @@ async function handleSearch(url: URL): Promise<Response> {
       tracks?: { items: SpApiTrack[] };
       artists?: { items: SpApiArtistFull[] };
       albums?: { items: SpApiAlbum[] };
+      playlists?: { items: (SpApiPlaylist | null)[] };
     }>(
-      `/search?q=${encodeURIComponent(q)}&type=track,artist,album&limit=${limit}&market=${encodeURIComponent(market)}`
+      `/search?q=${encodeURIComponent(q)}&type=track,artist,album,playlist&limit=${limit}&market=${encodeURIComponent(market)}`
     );
 
     const artists = (data.artists?.items ?? []).slice(0, 8).map((a) => ({
@@ -259,7 +270,20 @@ async function handleSearch(url: URL): Promise<Response> {
 
     const tracks = (data.tracks?.items ?? []).slice(0, limit).map(toHit);
 
-    const out = { configured: true, tracks, artists, albums };
+    // Spotify search returns null playlist entries for blocked playlists —
+    // skip them instead of shipping cards that 404 on open.
+    const playlists = (data.playlists?.items ?? [])
+      .filter((p): p is SpApiPlaylist => !!p && !!p.id)
+      .slice(0, 8)
+      .map((p) => ({
+        id: p.id,
+        title: p.name,
+        owner: p.owner?.display_name ?? "Spotify",
+        image: bestImage(p.images, 300),
+        totalTracks: p.tracks?.total ?? 0,
+      }));
+
+    const out = { configured: true, tracks, artists, albums, playlists };
     searchCache.set(key, { at: Date.now(), data: out });
     return json(out);
   } catch (e) {
@@ -269,6 +293,7 @@ async function handleSearch(url: URL): Promise<Response> {
         tracks: [],
         artists: [],
         albums: [],
+        playlists: [],
         error: e instanceof Error ? e.message : "spotify search failed",
       },
       502
@@ -394,9 +419,59 @@ async function handleStatus(): Promise<Response> {
   if (!credentials()) return json({ configured: false });
   try {
     await accessToken();
-    return json({ configured: true });
+    // clientId is the PUBLIC application id — the app's PKCE login needs it
+    // and PKCE involves no secret. Empty when unconfigured.
+    return json({ configured: true, clientId: env_str("SPOTIFY_CLIENT_ID") });
   } catch {
     return json({ configured: false });
+  }
+}
+
+// ── playlist page (app-token, public playlists) ────────────────────────────
+
+const playlistCache = new Map<string, { at: number; data: unknown }>();
+const PLAYLIST_TTL = 10 * 60 * 1000;
+
+async function handlePlaylist(url: URL): Promise<Response> {
+  const id = url.searchParams.get("id")?.trim();
+  if (!id || !/^[A-Za-z0-9]{16,30}$/.test(id)) return json({ error: "missing/invalid id" }, 400);
+  if (!credentials()) return json({ error: "not configured" }, 503);
+  const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+
+  const key = `${id}|${limit}`;
+  const hit = playlistCache.get(key);
+  if (hit && Date.now() - hit.at < PLAYLIST_TTL) {
+    return json({ ...(hit.data as object), cached: true });
+  }
+
+  try {
+    const meta = await spotifyApi<SpApiPlaylist & { tracks?: { total?: number } }>(
+      `/playlists/${encodeURIComponent(id)}?fields=id,name,owner.display_name,images,tracks.total`
+    );
+    const tracksRes = await spotifyApi<{ items: { track: SpApiTrack | null }[] }>(
+      `/playlists/${encodeURIComponent(id)}/tracks?limit=${limit}`
+    );
+    const tracks = (tracksRes.items ?? [])
+      .map((i) => i.track)
+      .filter((t): t is SpApiTrack => !!t && !!t.id)
+      .map(toHit);
+    const out = {
+      playlist: {
+        id: meta.id,
+        title: meta.name,
+        owner: meta.owner?.display_name ?? "Spotify",
+        image: bestImage(meta.images, 300),
+        totalTracks: meta.tracks?.total ?? tracks.length,
+      },
+      tracks,
+    };
+    playlistCache.set(key, { at: Date.now(), data: out });
+    return json(out);
+  } catch (e) {
+    return json(
+      { error: e instanceof Error ? e.message : "spotify playlist failed" },
+      (e as SpotifyUnavailableError)?.status === 404 ? 404 : 502
+    );
   }
 }
 
@@ -419,6 +494,8 @@ export default {
         return handleStatus();
       case "/search":
         return handleSearch(url);
+      case "/playlist":
+        return handlePlaylist(url);
       case "/picks":
         return handlePicks(url);
       case "/related":

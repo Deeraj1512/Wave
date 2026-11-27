@@ -4,12 +4,17 @@ A tiny metadata-only Cloudflare Worker. It holds the Spotify **client secret**
 (in Cloudflare env vars — never in the APK, never in this repo) and answers
 the four endpoints the app's Spotify layer consumes:
 
-| Endpoint              | What it returns                                    |
-| --------------------- | -------------------------------------------------- |
-| `/api/spotify/status` | `{ configured }` — the app's availability probe    |
-| `/api/spotify/search` | Spotify tracks / artists / albums (metadata only)  |
-| `/api/spotify/picks`  | Phase 3 recommendations (fallback lane on 403)     |
-| `/api/spotify/related`| Phase 3 fans-also-like (hidden while quota-gated)  |
+| Endpoint               | What it returns                                            |
+| ---------------------- | ---------------------------------------------------------- |
+| `/api/spotify/status`  | `{ configured, clientId }` — probe + PUBLIC app id for PKCE |
+| `/api/spotify/search`  | tracks / artists / albums / playlists (metadata only)       |
+| `/api/spotify/playlist`| one playlist page: metadata + track metadata                |
+| `/api/spotify/picks`   | Phase 3 recommendations (fallback lane on 403)              |
+| `/api/spotify/related` | Phase 3 fans-also-like (hidden while quota-gated)           |
+
+Your-library endpoints (/me/top, /me/tracks, /me/playlists) NEVER touch this
+worker — the app calls Spotify directly with the login token (PKCE, no
+secret involved).
 
 Matching Spotify tracks to playable YouTube videoIds happens **in the app**
 (`src/lib/spotify/match.ts`) over Wave's own YouTube Music chain — this
@@ -26,9 +31,11 @@ minutes:
    - My Profile → API Tokens → Create Token → template **"Edit Cloudflare
      Workers"** → create, copy the token.
 
-2. **Spotify** (free): developer.spotify.com/dashboard → Create app
-   (name `Wave`, which API: **Web API**, no redirect URIs — Client
-   Credentials only). Copy **Client ID** and **Client Secret**.
+2. **Spotify** (free): developer.spotify.com/dashboard → your `Wave` app.
+   Which API: **Web API**. Redirect URIs: `com.deeraj.wave://callback` and
+   `http://127.0.0.1:3000/callback` (login round-trips). **User Management**:
+   add the email of the account you will log in with (dev mode is
+   allow-list only). Copy **Client ID** and **Client Secret**.
 
 3. **GitHub repo** → Settings → Secrets and variables → Actions →
    **Secrets** tab → New repository secret, four times:

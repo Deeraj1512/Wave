@@ -4,19 +4,25 @@ import type { SpTrackHit } from "@/lib/spotify/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Cold-cache searches match up to 20 tracks through the YouTube chain — this
+// can exceed Vercel Hobby's default 10s function cap (the reported "Couldn't
+// reach Spotify" failure). Warm caches answer in ~1s; the cap only matters
+// on the first query after a deploy/cold start.
+export const maxDuration = 60;
 
 /**
  * GET /api/spotify/search?q=&limit=&market=
  *
- * METADATA-ONLY Spotify search (type=track,artist,album). The route is a pure
- * proxy: the client secret stays in server env, and matching to playable
- * videoIds happens CLIENT-side (src/lib/spotify/match.ts → the app's own
- * originals-only YTM chain). Tracks ship with videoId=null and the app fills
- * them before rendering — matched ones play, unmatched render dimmed.
+ * METADATA-ONLY Spotify search (type=track,artist,album,playlist). The route
+ * is a pure proxy: the client secret stays in server env, and matching to
+ * playable videoIds happens CLIENT-side (src/lib/spotify/match.ts → the app's
+ * own originals-only YTM chain). Tracks ship with videoId=null and the app
+ * fills them before rendering — matched ones play, unmatched render dimmed.
  * Artists and albums are plain Spotify entities: artists open the EXISTING
  * per-artist page by name, albums open the EXISTING YTM album page via entity
- * matching, so no parallel Spotify pages exist and the app's language/feed
- * machinery keeps applying everywhere.
+ * matching, playlists open Wave's Spotify playlist view, so no parallel
+ * Spotify pages exist and the app's language/feed machinery keeps applying
+ * everywhere.
  */
 
 interface SpApiImage { url: string; width: number; height: number }
@@ -42,6 +48,13 @@ interface SpApiAlbum {
   artists?: { name: string }[];
   images?: SpApiImage[];
 }
+interface SpApiPlaylist {
+  id: string;
+  name: string;
+  owner?: { display_name?: string };
+  tracks?: { total?: number };
+  images?: SpApiImage[];
+}
 
 /** Smallest image at ≥ want px (fallback: the largest available). */
 function bestImage(images: SpApiImage[] | undefined, want: number): string | undefined {
@@ -57,7 +70,7 @@ export async function GET(req: NextRequest) {
   const q = req.nextUrl.searchParams.get("q")?.trim();
   if (!q) return NextResponse.json({ error: "missing q" }, { status: 400 });
   if (!spotifyConfigured()) {
-    return NextResponse.json({ configured: false, tracks: [], artists: [], albums: [] });
+    return NextResponse.json({ configured: false, tracks: [], artists: [], albums: [], playlists: [] });
   }
   const market = req.nextUrl.searchParams.get("market") || "IN";
   const limit = Math.min(30, Math.max(1, parseInt(req.nextUrl.searchParams.get("limit") || "20", 10) || 20));
@@ -73,8 +86,9 @@ export async function GET(req: NextRequest) {
       tracks?: { items: SpApiTrack[] };
       artists?: { items: SpApiArtist[] };
       albums?: { items: SpApiAlbum[] };
+      playlists?: { items: (SpApiPlaylist | null)[] };
     }>(
-      `/search?q=${encodeURIComponent(q)}&type=track,artist,album&limit=${limit}&market=${encodeURIComponent(market)}`
+      `/search?q=${encodeURIComponent(q)}&type=track,artist,album,playlist&limit=${limit}&market=${encodeURIComponent(market)}`
     );
 
     const artists = (data.artists?.items ?? []).slice(0, 8).map((a) => ({
@@ -94,6 +108,19 @@ export async function GET(req: NextRequest) {
     }));
 
     const spTracks = (data.tracks?.items ?? []).slice(0, limit);
+
+    // Spotify search returns null playlist entries for blocked playlists —
+    // skip them instead of shipping cards that 404 on open.
+    const playlists = (data.playlists?.items ?? [])
+      .filter((p): p is SpApiPlaylist => !!p && !!p.id)
+      .slice(0, 8)
+      .map((p) => ({
+        id: p.id,
+        title: p.name,
+        owner: p.owner?.display_name ?? "Spotify",
+        image: bestImage(p.images, 300),
+        totalTracks: p.tracks?.total ?? 0,
+      }));
     const tracks: SpTrackHit[] = spTracks.map((t) => ({
       spotifyId: t.id,
       title: t.name,
@@ -107,7 +134,7 @@ export async function GET(req: NextRequest) {
       confidence: 0,
     }));
 
-    const out = { configured: true, tracks, artists, albums };
+    const out = { configured: true, tracks, artists, albums, playlists };
     cache.set(key, { at: Date.now(), data: out });
     return NextResponse.json(out);
   } catch (e) {
@@ -117,6 +144,7 @@ export async function GET(req: NextRequest) {
         tracks: [],
         artists: [],
         albums: [],
+        playlists: [],
         error: e instanceof Error ? e.message : "spotify search failed",
       },
       { status: 502 }

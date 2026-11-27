@@ -4,6 +4,7 @@ import { artistIdByName } from "@/lib/spotify/serverResolve";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60; // cold-cache recommendation/matching work can exceed Vercel Hobby's 10s default
 
 /**
  * GET /api/spotify/related?artist=Name&market=

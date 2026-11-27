@@ -1,5 +1,6 @@
 /**
- * OFFLINE matcher test — no network. Validates scoreHit() thresholds against
+ * OFFLINE matcher test — no network, targets the ACTIVE matcher (match.ts,
+ * the client-side one the app ships). Validates scoreHit() thresholds against
  * realistic Spotify-track → YTM-candidate pairs drawn from the Indian market
  * (Telugu/Hindi film songs, "- Topic" uploads, jukeboxes, nightcore, 1-hour
  * loops). Run: bun run scripts/test_spotify_match.ts — exits 1 on any failure.
@@ -10,7 +11,7 @@
  *   number < 48     → below the acceptance bar (ships UNMATCHED)
  */
 
-import { scoreHit, type SpMatchInput } from "../src/lib/spotify/serverMatch";
+import { scoreHit, type SpMatchInput } from "../src/lib/spotify/match";
 
 interface Case {
   label: string;

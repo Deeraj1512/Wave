@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useRef, useState, useEffect } from "react";
-import { Clock, Disc3, Loader2, Music2, Play, Search, WifiOff, X } from "lucide-react";
+import { useMemo, useRef, useState, useEffect, useSyncExternalStore } from "react";
+import { Clock, Disc3, ListMusic, Loader2, LogIn, LogOut, Music2, Play, Search, WifiOff, X } from "lucide-react";
 import { TrackRow } from "../TrackRow";
 import { Cover } from "../Cover";
+import { usePlayer } from "@/lib/player";
 import { GENRE_TILES } from "@/lib/data";
 import { searchFullApi, albumSearchApi, albumBrowseApi, suggestApi, type ApiAlbum } from "@/lib/api";
 import { groupAlbums, registerAlbum } from "@/lib/albums";
@@ -13,10 +14,13 @@ import {
   spotifyAvailable,
   spotifyHitToTrack,
   spotifyPicks,
+  spotifyPlaylistPage,
   spotifyRelated,
   spotifySearch,
 } from "@/lib/spotify/bridge";
-import type { SpAlbumLite, SpArtistLite, SpTrackHit } from "@/lib/spotify/types";
+import type { SpAlbumLite, SpArtistLite, SpPlaylistLite, SpPlaylistResult, SpTrackHit } from "@/lib/spotify/types";
+import { spotifyLoggedIn, spotifyLogin, spotifyLogout, spotifyUserEmail, subscribeUserAuth } from "@/lib/spotify/userAuth";
+import { spotifySavedTracks, spotifyTopArtists, spotifyTopTracks, spotifyUserPlaylists } from "@/lib/spotify/user";
 import { goToArtist } from "@/lib/goToArtist";
 import { recentPlays, topArtists } from "@/lib/history";
 import { rankedTasteLangs } from "@/lib/profile";
@@ -115,9 +119,14 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
   const [searching, setSearching] = useState(false);
   const [failure, setFailure] = useState<{ q: string } | null>(null);
   const [tab, setTab] = useState<"songs" | "albums" | "spotify">("songs");
+  // Spotify playlist page — rendered in-tab like the album view (both the
+  // search-results cards and the user-playlists cards open here).
+  const [spPlaylist, setSpPlaylist] = useState<SpPlaylistResult | null>(null);
+  const [spPlOpening, setSpPlOpening] = useState<string | null>(null);
   const switchTab = (t: "songs" | "albums" | "spotify") => {
     setTab(t);
     if (openAlbum) setOpenAlbum(null); // leaving the album page via the tabs
+    if (spPlaylist) setSpPlaylist(null); // leaving the playlist page via the tabs
   };
   useEffect(() => {
     const query = q.trim();
@@ -257,6 +266,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
   const [spHits, setSpHits] = useState<SpTrackHit[]>([]);
   const [spArtists, setSpArtists] = useState<SpArtistLite[]>([]);
   const [spAlbums, setSpAlbums] = useState<SpAlbumLite[]>([]);
+  const [spPlaylists, setSpPlaylists] = useState<SpPlaylistLite[]>([]);
   const [spLoading, setSpLoading] = useState(false);
   const [spError, setSpError] = useState(false);
   const [spOpening, setSpOpening] = useState<string | null>(null);
@@ -269,6 +279,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
         setSpHits([]);
         setSpArtists([]);
         setSpAlbums([]);
+        setSpPlaylists([]);
         setSpLoading(false);
         setSpError(false);
         return;
@@ -279,6 +290,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           setSpHits(res.tracks);
           setSpArtists(res.artists.slice(0, 8));
           setSpAlbums(res.albums.slice(0, 8));
+          setSpPlaylists(res.playlists ?? []);
           setSpError(false);
           setSpLoading(false);
         })
@@ -287,6 +299,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           setSpHits([]);
           setSpArtists([]);
           setSpAlbums([]);
+          setSpPlaylists([]);
           setSpError(true);
           setSpLoading(false);
         });
@@ -345,6 +358,26 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
       });
     } finally {
       setSpOpening(null);
+    }
+  };
+
+  // Spotify playlist page (in-tab). The bridge returns metadata + matched
+  // tracks (matching rides the app's own YTM chain inside spotifyPlaylistPage).
+  const openSpPlaylist = async (p: SpPlaylistLite) => {
+    if (spPlOpening) return;
+    setSpPlOpening(p.id);
+    try {
+      const page = await spotifyPlaylistPage(p.id);
+      setSpPlaylist(page);
+      commitRecent(q);
+    } catch {
+      toast({
+        title: "Couldn't open this playlist",
+        description: "The bridge couldn't load it — try again in a moment",
+        duration: 3000,
+      });
+    } finally {
+      setSpPlOpening(null);
     }
   };
 
@@ -449,7 +482,10 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
         </div>
       </div>
 
-      {q.trim() ? (
+      {onSpotify && spPlaylist ? (
+        // ── Spotify playlist page (in-tab, above any query state) ──
+        <SpPlaylistView page={spPlaylist} onBack={() => setSpPlaylist(null)} />
+      ) : q.trim() ? (
         // ── Results view ── (any result tap commits the current query to recents)
         <div onClickCapture={() => commitRecent()}>
         {albumOpen ? (
@@ -459,11 +495,14 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
             hits={spHits}
             artists={spArtists}
             albums={spAlbums}
+            playlists={spPlaylists}
             loading={spLoading}
             failed={spError}
             query={q.trim()}
             opening={spOpening}
+            openingPlaylist={spPlOpening}
             onOpenAlbum={(a) => void openSpAlbum(a)}
+            onOpenPlaylist={(p) => void openSpPlaylist(p)}
           />
         ) : searching && results.length === 0 ? (
           <div className="space-y-2 py-6">
@@ -588,7 +627,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
         </div>
       ) : onSpotify ? (
         // ── Spotify picks (Phase 3) — the empty-state shelf of the Spotify tab ──
-        <SpotifyPicksPanel active />
+        <SpotifyPicksPanel active onOpenPlaylist={(p) => void openSpPlaylist(p)} />
       ) : (
         // ── Browse view ──
         <div className="space-y-9">
@@ -652,20 +691,26 @@ function SpotifyResults({
   hits,
   artists,
   albums,
+  playlists,
   loading,
   failed,
   query,
   opening,
+  openingPlaylist,
   onOpenAlbum,
+  onOpenPlaylist,
 }: {
   hits: SpTrackHit[];
   artists: SpArtistLite[];
   albums: SpAlbumLite[];
+  playlists: SpPlaylistLite[];
   loading: boolean;
   failed: boolean;
   query: string;
   opening: string | null;
+  openingPlaylist: string | null;
   onOpenAlbum: (a: SpAlbumLite) => void;
+  onOpenPlaylist: (p: SpPlaylistLite) => void;
 }) {
   if (failed) {
     return (
@@ -676,7 +721,7 @@ function SpotifyResults({
       </div>
     );
   }
-  const empty = hits.length === 0 && artists.length === 0 && albums.length === 0;
+  const empty = hits.length === 0 && artists.length === 0 && albums.length === 0 && playlists.length === 0;
   if (empty && !loading) {
     return (
       <div className="py-16 text-center">
@@ -766,6 +811,42 @@ function SpotifyResults({
         </section>
       )}
 
+      {playlists.length > 0 && (
+        <section aria-label="Spotify playlists">
+          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Playlists</h2>
+          <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
+            {playlists.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => onOpenPlaylist(p)}
+                disabled={!!openingPlaylist}
+                className="w-40 shrink-0 rounded-2xl p-2 text-left transition hover:bg-surface-2"
+                aria-label={`Open playlist ${p.title}`}
+              >
+                <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30 bg-surface-3">
+                  {p.image ? (
+                    <img src={p.image} alt="" loading="lazy" className="h-full w-full object-cover" />
+                  ) : (
+                    <span className="flex h-full w-full items-center justify-center bg-surface-3">
+                      <ListMusic className="h-6 w-6 text-muted-foreground" />
+                    </span>
+                  )}
+                  {openingPlaylist === p.id && (
+                    <span className="absolute inset-0 flex items-center justify-center bg-black/50">
+                      <Loader2 className="h-4 w-4 animate-spin text-white" />
+                    </span>
+                  )}
+                </span>
+                <span className="mt-2 block truncate text-[13px] font-bold text-foreground">{p.title}</span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {[p.owner, p.totalTracks ? `${p.totalTracks} songs` : ""].filter(Boolean).join(" \u00b7 ")}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
       {hits.length > 0 && (
         <section aria-label="Spotify songs">
           {(artists.length > 0 || albums.length > 0) && (
@@ -813,13 +894,57 @@ interface PicksData {
   related: SpArtistLite[];
 }
 
-let picksCache: { at: number; data: PicksData } | null = null;
+/** The listener's OWN library (Phase 2) once PKCE-logged in. */
+interface UserData {
+  artists: SpArtistLite[];
+  top: SpTrackHit[];
+  saved: SpTrackHit[];
+  playlists: SpPlaylistLite[];
+}
 
-function SpotifyPicksPanel({ active }: { active: boolean }) {
+let picksCache: { at: number; data: PicksData } | null = null;
+let userCache: { at: number; data: UserData } | null = null;
+
+function SpotifyPicksPanel({
+  active,
+  onOpenPlaylist,
+}: {
+  active: boolean;
+  onOpenPlaylist: (p: SpPlaylistLite) => void;
+}) {
   const [data, setData] = useState<PicksData | null>(() =>
     picksCache && Date.now() - picksCache.at < 10 * 60 * 1000 ? picksCache.data : null
   );
   const [loading, setLoading] = useState(false);
+  const { toast } = useToast();
+
+  // ── My Spotify (Phase 2): the listener's own library once logged in ──
+  const loggedIn = useSyncExternalStore(subscribeUserAuth, spotifyLoggedIn, () => false);
+  const [userData, setUserData] = useState<UserData | null>(() =>
+    userCache && Date.now() - userCache.at < 10 * 60 * 1000 ? userCache.data : null
+  );
+  const [userLoading, setUserLoading] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const email = loggedIn ? spotifyUserEmail() : undefined;
+
+  const connect = async () => {
+    if (connecting) return;
+    setConnecting(true);
+    try {
+      await spotifyLogin(); // resolves after the browser round-trip
+    } catch (e) {
+      toast({
+        title: "Spotify sign-in didn't finish",
+        description:
+          e instanceof Error
+            ? e.message
+            : "Try again — make sure your account email is added under User Management in the Spotify dashboard",
+        duration: 4500,
+      });
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   useEffect(() => {
     if (!active || data || loading) return;
@@ -875,6 +1000,35 @@ function SpotifyPicksPanel({ active }: { active: boolean }) {
     };
   }, [active, data, loading]);
 
+  // Your library: top artists / top tracks / saved songs / playlists — fetched
+  // once per session with the user token (endpoints that WORK in dev mode,
+  // unlike the gated recommendation engine). Matched like everything else.
+  useEffect(() => {
+    if (!active || !loggedIn || userData || userLoading) return;
+    let alive = true;
+    setUserLoading(true);
+    (async () => {
+      try {
+        const [artists, top, saved, playlists] = await Promise.all([
+          spotifyTopArtists(8).catch(() => [] as SpArtistLite[]),
+          spotifyTopTracks(12).catch(() => [] as SpTrackHit[]),
+          spotifySavedTracks(10).catch(() => [] as SpTrackHit[]),
+          spotifyUserPlaylists(10).catch(() => [] as SpPlaylistLite[]),
+        ]);
+        const out: UserData = { artists, top, saved, playlists };
+        if (alive) {
+          setUserData(out);
+          userCache = { at: Date.now(), data: out };
+        }
+      } finally {
+        if (alive) setUserLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [active, loggedIn, userData, userLoading]);
+
   if (!active) return null;
   if (loading && !data) {
     return (
@@ -891,11 +1045,122 @@ function SpotifyPicksPanel({ active }: { active: boolean }) {
       </div>
     );
   }
-  if (!data || data.rows.length === 0) return null;
-
   return (
     <div className="space-y-7">
-      {data.related.length > 0 && (
+      <section aria-label="Spotify account">
+        {loggedIn ? (
+          <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-2 px-4 py-3">
+            <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#1DB954]" aria-hidden />
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
+              {email ?? "Spotify account connected"}
+            </span>
+            <button
+              onClick={() => spotifyLogout()}
+              className="flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold text-muted-foreground transition hover:bg-surface-3 hover:text-foreground"
+              aria-label="Log out of Spotify"
+            >
+              <LogOut className="h-3.5 w-3.5" /> Log out
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-2 px-4 py-3">
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-bold text-foreground">Use your Spotify library</span>
+              <span className="block text-xs text-muted-foreground">
+                Your playlists, saved songs and top artists — audio still streams from YouTube.
+              </span>
+            </span>
+            <button
+              onClick={() => void connect()}
+              disabled={connecting}
+              className="flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--accent)] px-4 py-2 text-xs font-bold text-white transition hover:opacity-90 disabled:opacity-60"
+              aria-label="Connect Spotify"
+            >
+              {connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
+              {connecting ? "Opening" : "Connect"}
+            </button>
+          </div>
+        )}
+      </section>
+
+      {userData && userData.artists.length > 0 && (
+        <section aria-label="Your top artists">
+          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
+            Your top artists
+          </h2>
+          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-1">
+            {userData.artists.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => goToArtist(a.name)}
+                className="flex w-20 shrink-0 flex-col items-center gap-2"
+                aria-label={`Open artist ${a.name}`}
+              >
+                <span className="h-20 w-20 overflow-hidden rounded-full border border-border bg-surface-2">
+                  {a.image ? (
+                    <img src={a.image} alt="" loading="lazy" className="h-full w-full object-cover" />
+                  ) : (
+                    <span className="flex h-full w-full items-center justify-center text-lg font-black text-muted-foreground">
+                      {a.name.slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                </span>
+                <span className="w-full truncate text-center text-xs font-semibold text-foreground">{a.name}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {userData && userData.top.length > 0 && (
+        <section aria-label="Your top tracks">
+          <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
+            Your top tracks
+          </h2>
+          <SpRowList rows={userData.top} />
+        </section>
+      )}
+
+      {userData && userData.saved.length > 0 && (
+        <section aria-label="Saved on Spotify">
+          <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
+            Saved on Spotify
+          </h2>
+          <SpRowList rows={userData.saved} />
+        </section>
+      )}
+
+      {userData && userData.playlists.length > 0 && (
+        <section aria-label="Your playlists">
+          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
+            Your playlists
+          </h2>
+          <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
+            {userData.playlists.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => onOpenPlaylist(p)}
+                className="w-40 shrink-0 rounded-2xl p-2 text-left transition hover:bg-surface-2"
+                aria-label={`Open playlist ${p.title}`}
+              >
+                <span className="flex aspect-square w-full items-center justify-center overflow-hidden rounded-xl bg-surface-3 shadow-lg shadow-black/30">
+                  {p.image ? (
+                    <img src={p.image} alt="" loading="lazy" className="h-full w-full object-cover" />
+                  ) : (
+                    <ListMusic className="h-6 w-6 text-muted-foreground" />
+                  )}
+                </span>
+                <span className="mt-2 block truncate text-[13px] font-bold text-foreground">{p.title}</span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {[p.owner, p.totalTracks ? `${p.totalTracks} songs` : ""].filter(Boolean).join(" \u00b7 ")}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {data && data.related.length > 0 && (
         <section aria-label="Fans also like">
           <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
             {data.anchor ? `Fans of ${data.anchor} also like` : "Fans also like"}
@@ -924,30 +1189,100 @@ function SpotifyPicksPanel({ active }: { active: boolean }) {
         </section>
       )}
 
-      <section aria-label="Spotify picks">
-        <h2 className="mb-2 flex items-center gap-2 px-1 text-lg font-extrabold tracking-tight">
-          <Music2 className="h-4 w-4 text-muted-foreground" /> Spotify picks
-        </h2>
-        <div className="space-y-0.5">
-          {data.rows.map((h) =>
-            h.videoId ? (
-              <TrackRow key={h.spotifyId} track={spotifyHitToTrack(h)} radio />
-            ) : (
-              <div key={`sp-${h.spotifyId}`} className="flex items-center gap-4 rounded-xl px-3 py-2 opacity-50">
-                <span className="h-12 w-12 shrink-0 overflow-hidden rounded-lg bg-surface-3">
-                  {h.image ? <img src={h.image} alt="" loading="lazy" className="h-full w-full object-cover" /> : null}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-semibold text-foreground">{h.title}</span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {h.artist ? `${h.artist} · ` : ""}no YouTube match
-                  </span>
-                </span>
-              </div>
-            )
+      {data && data.rows.length > 0 && (
+        <section aria-label="Spotify picks">
+          <h2 className="mb-2 flex items-center gap-2 px-1 text-lg font-extrabold tracking-tight">
+            <Music2 className="h-4 w-4 text-muted-foreground" /> Spotify picks
+          </h2>
+          <SpRowList rows={data.rows} />
+        </section>
+      )}
+    </div>
+  );
+}
+
+/** Matched → playable row; unmatched → dimmed, honest "no YouTube match". */
+function SpRowList({ rows }: { rows: SpTrackHit[] }) {
+  return (
+    <div className="space-y-0.5">
+      {rows.map((h) =>
+        h.videoId ? (
+          <TrackRow key={h.spotifyId} track={spotifyHitToTrack(h)} radio />
+        ) : (
+          <div key={`sp-${h.spotifyId}`} className="flex items-center gap-4 rounded-xl px-3 py-2 opacity-50">
+            <span className="h-12 w-12 shrink-0 overflow-hidden rounded-lg bg-surface-3">
+              {h.image ? <img src={h.image} alt="" loading="lazy" className="h-full w-full object-cover" /> : null}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-semibold text-foreground">{h.title}</span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {h.artist ? `${h.artist} · ` : ""}no YouTube match
+              </span>
+            </span>
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+/** Spotify playlist page (in-tab, like the album view). Hero + play-all over
+ *  the EXISTING player, then every row; unmatched ones stay dimmed. */
+function SpPlaylistView({ page, onBack }: { page: SpPlaylistResult; onBack: () => void }) {
+  const { playTrack } = usePlayer();
+  const playable = page.tracks.filter((h) => h.videoId).map(spotifyHitToTrack);
+  const cover = page.playlist.image;
+  const matched = playable.length;
+  const totalMin = Math.round(page.tracks.reduce((s, t) => s + t.durationSec, 0) / 60);
+  return (
+    <div className="space-y-6 pb-8">
+      <div
+        className="relative -mx-4 -mt-4 overflow-hidden px-4 pb-6 pt-4 sm:-mx-6 sm:px-6"
+        style={{ background: "linear-gradient(180deg, rgba(255,255,255,0.07) 0%, transparent 100%)" }}
+      >
+        <button
+          onClick={onBack}
+          className="mb-5 flex h-10 w-10 items-center justify-center rounded-full bg-surface-2 transition hover:bg-surface-3"
+          aria-label="Go back"
+        >
+          <X className="h-5 w-5" />
+        </button>
+        <div className="flex flex-col items-center gap-6 text-center sm:flex-row sm:items-end sm:text-left">
+          {cover ? (
+            <img
+              src={cover}
+              alt=""
+              className="h-40 w-40 shrink-0 rounded-3xl object-cover shadow-xl shadow-black/40 sm:h-48 sm:w-48"
+            />
+          ) : (
+            <span className="flex h-40 w-40 shrink-0 items-center justify-center rounded-3xl bg-surface-3 shadow-xl shadow-black/40 sm:h-48 sm:w-48">
+              <ListMusic className="h-10 w-10 text-muted-foreground" />
+            </span>
           )}
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground">Playlist</p>
+            <h1 className="mt-1 break-words text-3xl font-black tracking-tight sm:text-5xl">{page.playlist.title}</h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {page.playlist.owner} · {page.playlist.totalTracks ?? page.tracks.length} song
+              {(page.playlist.totalTracks ?? page.tracks.length) === 1 ? "" : "s"}
+              {totalMin > 0 && <> · about {totalMin} min</>}
+              {matched < page.tracks.length && <> · {page.tracks.length - matched} without YouTube match</>}
+            </p>
+          </div>
         </div>
-      </section>
+        {playable.length > 0 && (
+          <div className="mt-6 flex items-center gap-3">
+            <button
+              onClick={() => playTrack(playable[0], playable, page.playlist.title)}
+              className="flex items-center gap-2 rounded-full bg-[var(--accent)] px-6 py-3 text-sm font-bold text-white shadow-lg transition hover:opacity-90"
+              aria-label="Play playlist"
+            >
+              <Play className="h-4 w-4" /> Play
+            </button>
+          </div>
+        )}
+      </div>
+      <SpRowList rows={page.tracks} />
     </div>
   );
 }

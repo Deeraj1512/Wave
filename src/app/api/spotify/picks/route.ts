@@ -5,6 +5,7 @@ import type { SpTrackHit } from "@/lib/spotify/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60; // cold-cache recommendation/matching work can exceed Vercel Hobby's 10s default
 
 /**
  * GET /api/spotify/picks?artists=Name1,Name2&genres=telugu,hindi&limit=&market=

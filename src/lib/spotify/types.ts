@@ -1,11 +1,12 @@
 /**
  * Spotify catalog entity shapes as the Wave app consumes them.
  *
- * The bridge (/api/spotify/* routes) does ALL Spotify work server-side — the
- * client secret lives in server env vars only — and hands the app fully
- * resolved entities. Tracks arrive pre-matched to playable YouTube videoIds,
- * so playback, queue, radio and history run on the EXISTING pipeline
- * unchanged (the YT IFrame engine / googlevideo chain never sees Spotify).
+ * The bridge (Cloudflare Worker in production, /api/spotify/* dev routes on
+ * web) is a METADATA-ONLY Spotify proxy — the client secret lives in server
+ * env only, and NO YouTube involvement server-side. Matching metadata to
+ * playable videoIds happens in the app (match.ts) over Wave's own originals-
+ * only YTM chain, so playback, queue, radio and history run on the EXISTING
+ * pipeline unchanged.
  */
 
 export interface SpotifyImage {
@@ -32,6 +33,21 @@ export interface SpAlbumLite {
   totalTracks?: number;
 }
 
+/** Playlist card (search results / user playlists) — opens Wave's Spotify playlist view. */
+export interface SpPlaylistLite {
+  id: string;
+  title: string;
+  owner: string;
+  image?: string;
+  totalTracks?: number;
+}
+
+/** Full playlist page: metadata + its tracks (metadata-only; the app matches them). */
+export interface SpPlaylistResult {
+  playlist: SpPlaylistLite;
+  tracks: SpTrackHit[];
+}
+
 /** A Spotify track resolved (matched) to a playable Wave track. */
 export interface SpTrackHit {
   spotifyId: string;
@@ -54,6 +70,7 @@ export interface SpSearchResult {
   tracks: SpTrackHit[];
   artists: SpArtistLite[];
   albums: SpAlbumLite[];
+  playlists?: SpPlaylistLite[];
   cached?: boolean;
   error?: string;
 }

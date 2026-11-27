@@ -1,106 +1,108 @@
-# Wave × Spotify — setup (Phase 1 + Phase 3)
+# Wave × Spotify — setup (search, your library, picks, playlists)
 
 Wave keeps playing **YouTube audio** through its existing Echo chain / IFrame
-engine. Spotify adds **catalog quality**: real studio metadata, proper artist
-and album artwork (300 px cards / 640 px detail pages), search that understands
-official releases, and (when Spotify grants it) recommendations. The app never
-plays "from Spotify" — every Spotify track is matched to a YouTube videoId by
-the server-side matcher before it reaches the player.
+engine. Spotify adds **catalog quality**: real studio metadata, proper
+artwork (300 px cards / 640 px detail images), search that understands
+official releases, YOUR Spotify library (playlists / saved songs / top
+artists) and personalized picks. The app never plays "from Spotify" — every
+Spotify track is matched to a YouTube videoId by the on-device matcher
+(official uploads only) before it reaches the player.
 
 ```
 Wave APK (WebView + MediaPlaybackService)
    │  HTTPS (CapacitorHttp — no CORS)
    ▼
-/api/spotify/*  on the deployed Wave site (this same repo, Next.js API routes)
-   ├─ /status      availability probe (hides all Spotify UI when unconfigured)
-   ├─ /search      track + artist + album search → tracks pre-matched to videoIds
-   ├─ /picks       recommendations seeded by listening history
-   │               (falls back to popularity-ranked search while quota-gated)
-   ├─ /related     "fans also like" (hidden while quota-gated)
-   └─ SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET live in the server env ONLY
+Cloudflare Worker bridge (bridge/ in this repo, auto-deployed by GitHub Actions)
+   ├─ /status      probe + PUBLIC client id (for the in-app login)
+   ├─ /search      tracks + artists + albums + PLAYLISTS (metadata only)
+   ├─ /playlist    one playlist page (metadata only)
+   ├─ /picks       recommendations (falls back to popularity search while gated)
+   ├─ /related     fans-also-like (hidden while gated)
+   └─ SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET live in Worker secrets ONLY
+        │
+        ▼  (your library: /me/* endpoints run ON DEVICE with your login token)
+Spotify login = Authorization Code + PKCE in the system browser — NO secret
+involved; tokens stay in the app. Matching to YouTube happens in the app
+(src/lib/spotify/match.ts) over the same originals-only chain search uses.
 ```
-
-The client secret never enters the repo or the APK — the APK bakes in only the
-bridge's public URL.
 
 ## Step 1 — Spotify app in the Developer Dashboard
 
-1. https://developer.spotify.com/dashboard → **Create app**.
-2. **Which API/SDKs are you planning to use?** tick **Web API** (IFrame/Android
-   playback is Wave's own — untick everything else; do NOT tick Web Playback SDK).
-3. **Redirect URIs** — the dashboard makes you save at least one even though
-   Client Credentials never redirects. Add:
-   - `http://127.0.0.1:3000/callback`  (formality for now; `localhost` is rejected, use 127.0.0.1)
-   - optional, for a future in-app Spotify login: `com.deeraj.wave://callback`
-4. APIs used: **Web API**. Save.
-5. Copy the **Client ID** and reveal the **Client Secret** — you will paste
-   these into the hosting dashboard in step 2, nowhere else.
+1. https://developer.spotify.com/dashboard → your `Wave` app (or Create app).
+2. **Which API/SDKs are you planning to use?** tick **Web API** only.
+3. **Redirect URIs** — BOTH of these, exact, no trailing slash:
+   - `com.deeraj.wave://callback`  (in-app login — deep links back into Wave)
+   - `http://127.0.0.1:3000/callback`  (web dev runtime)
+4. **User Management** (left sidebar of the app page): **Add the email of the
+   Spotify account you will log in with.** In Development Mode ONLY these
+   allow-listed users can sign in — skipping this makes the login fail.
+   (Up to 25 users; for a private app this IS the access control.)
+5. Copy the **Client ID** and **Client Secret** — they go into GitHub secrets
+   in step 2, nowhere else.
 
-## Step 2 — Deploy the bridge from THIS GitHub repo (Vercel, free)
+## Step 2 — Deploy the bridge (automatic, from GitHub)
 
-The API routes already live in this repo (`src/app/api/spotify/*`). Vercel's
-free Hobby tier imports a GitHub repo directly — no config file, no Netlify,
-no extra repository needed.
+The bridge is a tiny Cloudflare Worker in `bridge/`, deployed by the
+**Spotify bridge (Cloudflare Worker)** workflow. One-time setup
+(full detail in `bridge/README.md`):
 
-1. https://vercel.com → sign up / log in **with GitHub**.
-2. **Add New… → Project** → import **Deeraj1512/Wave**.
-3. Framework Preset auto-detects **Next.js**. Leave build settings untouched.
-4. **Environment Variables** — add both:
-   - `SPOTIFY_CLIENT_ID`  = your client id
-   - `SPOTIFY_CLIENT_SECRET` = your client secret
-5. **Deploy**. You get a URL like `https://wave-xxxx.vercel.app`.
-6. Verify in a browser: `https://wave-xxxx.vercel.app/api/spotify/status`
-   → `{"configured":true}`. If it says `configured:false`, re-check step 4.
+1. Cloudflare account → copy **Account ID**; create an API token with
+   **Edit Cloudflare Workers**.
+2. GitHub repo → Settings → Secrets and variables → Actions → **Secrets**:
+   `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `SPOTIFY_CLIENT_ID`,
+   `SPOTIFY_CLIENT_SECRET`.
+3. Run that workflow once. The deploy log prints
+   `https://wave-bridge.<your-subdomain>.workers.dev`.
+4. Variables tab → `NEXT_PUBLIC_SPOTIFY_BRIDGE_URL` = that URL (no slash).
+5. Re-run **Android APK**.
 
-(Any Node host works the same way — the routes are plain Next.js handlers —
-but Vercel is the one-click path straight from this GitHub repo.)
+Verify: `https://wave-bridge.<subdomain>.workers.dev/api/spotify/status`
+must answer `{"configured":true,"clientId":"…"}`.
 
-## Step 3 — Tell the APK where the bridge lives
+## Step 3 — Build, install, sign in
 
-GitHub repo → **Settings → Secrets and variables → Actions → Variables tab →
-New repository variable**:
-
-- Name: `NEXT_PUBLIC_SPOTIFY_BRIDGE_URL`
-- Value: `https://wave-xxxx.vercel.app`  (no trailing slash)
-
-`.github/workflows/android.yml` passes this variable into `bun run build:apk`;
-`next build` inlines it into the static export and `src/lib/spotify/config.ts`
-reads it inside the APK. Until the variable is set, the APK builds fine but the
-Spotify tab stays hidden — Wave keeps working as a pure YTM app.
-
-## Step 4 — Build and verify
-
-1. Push (or re-run the last **Android APK** workflow). Install the new APK
-   **on top of** the old one — the signing key is permanent, no uninstall.
-2. In Wave: search anything → the **Spotify** tab now appears next to
-   Songs/Albums.
-3. Spotify results: matched songs play through the normal player, queue,
-   radio and lock-screen controls; artist chips open the existing per-artist
-   page; album cards open the existing album page; unmatchable tracks show
-   dimmed with "no YouTube match" instead of failing silently.
-4. Empty search box + Spotify tab → **Spotify picks** (seeded by your listening
-   history and taste languages) and, when Spotify allows it, **fans also like**.
+1. Wait for the green Android APK run → install **on top of** the current app.
+2. Wave → Search → the **Spotify** tab: search anything; playlists appear as
+   cards too; open one — every track lands on official YouTube audio.
+3. Empty query on the Spotify tab (or Home) → **Connect Spotify** → the
+   system browser opens → sign in with the allow-listed account → back in the
+   app automatically. Your top artists, top tracks, saved songs and playlists
+   then fill the Spotify tab and the Home feed.
+4. Log out any time from the account row in the Spotify tab.
 
 ## Quota reality (Nov 2024 Spotify API changes)
 
-Apps in Development Mode (default) get `/v1/recommendations` and
-`/v1/artists/:id/related-artists` **403** — and `preview_url` is null.
+Development Mode apps: `/recommendations` and related-artists answer **403**,
+`preview_url` is null. Wave is built for this:
 
-- Wave is built for this: picks fall back to popularity-ranked Spotify search
-  from the same seeds; the related-artists row simply hides.
-- To unlock the real recommendation engine, request **Extended Quota Mode**
-  (Dashboard → your app →Extensions) — when granted, both features start
-  working with zero code changes.
+- **Picks** fall back to popularity-ranked Spotify search from the same seeds;
+- **Fans also like** hides;
+- **Your library** (top artists / top tracks / saved / playlists) uses
+  endpoints that DO work in dev mode — no quota needed;
+- requesting **Extended Quota Mode** upgrades picks + related to the real
+  engines with zero code changes.
+
+## If "Couldn't reach Spotify" appears
+
+- The status call works (the tab exists) but a heavier call failed.
+- First search after a deploy/cold start is the slow one — try again once;
+  warm results cache for 10 minutes.
+- Matching happens ON DEVICE, so bridge calls are fast metadata-only reads —
+  if errors persist, check the Worker logs (Cloudflare dashboard → Workers →
+  wave-bridge → Logs) and that the repo secrets are still valid.
 
 ## Files
 
 | Path | Role |
 | --- | --- |
-| `src/app/api/spotify/{status,search,picks,related}/route.ts` | the bridge (server-only) |
-| `src/lib/spotify/serverAuth.ts` | Client Credentials token mint + cache + gating detection |
-| `src/lib/spotify/serverMatch.ts` | Spotify track → YouTube videoId matcher (scoring, tiers, caches) |
-| `src/lib/spotify/serverResolve.ts` | artist name → Spotify id, genre-seed validation |
-| `src/lib/spotify/bridge.ts` | client calls + Spotify hit → Wave Track conversion |
-| `src/lib/spotify/config.ts` | bridge origin: web same-origin / APK build-time constant |
-| `src/components/screens/Search.tsx` | Spotify tab + picks panel (UI) |
-| `scripts/test_spotify_match.ts` | offline matcher tests — `bun run scripts/test_spotify_match.ts` |
+| `bridge/src/index.ts` | the Worker bridge (deployed automatically) |
+| `src/app/api/spotify/*` | same endpoints as dev routes for the web runtime |
+| `src/lib/spotify/match.ts` | on-device Spotify → YouTube matcher (official uploads only) |
+| `src/lib/spotify/bridge.ts` | bridge calls + hit → Track conversion |
+| `src/lib/spotify/userAuth.ts` | PKCE login (system browser + deep link back) |
+| `src/lib/spotify/user.ts` | your library: top artists/tracks, saved, playlists |
+| `src/lib/spotify/config.ts` | bridge origin (web same-origin / APK build-time constant) |
+| `src/components/screens/Search.tsx` | Spotify tab: results, playlists, your library |
+| `src/components/screens/Home.tsx` | Home feed shelves from your library |
+| `scripts/test_spotify_match.ts` | matcher tests — `bun run scripts/test_spotify_match.ts` |
+| `scripts/test_spotify_pkce.ts` | PKCE tests — `bun run scripts/test_spotify_pkce.ts` |

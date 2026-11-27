@@ -24,6 +24,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- Spotify login (PKCE): the system browser redirects back into
+                 the app via this custom scheme after the user signs in. The
+                 URI must stay EXACTLY com.deeraj.wave://callback — it is
+                 registered as a redirect URI in the Spotify dashboard. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="com.deeraj.wave" android:host="callback" />
+            </intent-filter>
+
         </activity>
 
         <!-- Background play: JS starts/stops this around audible playback; the

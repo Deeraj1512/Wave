@@ -100,7 +100,15 @@ function sim(a: string, b: string): number {
   const fb = fold(b);
   if (!fa || !fb) return 0;
   if (fa === fb) return 1;
-  if (fa.includes(fb) || fb.includes(fa)) return 0.92;
+  // Containment ("Armaan Malik" vs "Armaan Malik - Topic", "X (Official Audio)")
+  // — but ONLY when the extra material is a token or two. A podcast titled
+  // "Interview: How We Wrote Naatu Naatu" also contains the song name; without
+  // the guard it rides the 0.92 shortcut straight past the acceptance bar.
+  const [shorter, longer] = fa.length <= fb.length ? [fa, fb] : [fb, fa];
+  if (longer.includes(shorter)) {
+    const extra = tokens(longer).size - tokens(shorter).size;
+    if (extra <= 1) return 0.92;
+  }
   return dice(tokens(a), tokens(b));
 }
 

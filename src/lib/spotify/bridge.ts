@@ -21,10 +21,17 @@ import type { Track } from "../types";
 import { spotifyBridgeBase } from "./config";
 import { matchSpotifyBatch } from "./match";
 import type { SpMatchInput } from "./match";
-import type { SpPicksResult, SpRelatedResult, SpSearchResult, SpTrackHit } from "./types";
+import type {
+  SpPicksResult,
+  SpPlaylistLite,
+  SpPlaylistResult,
+  SpRelatedResult,
+  SpSearchResult,
+  SpTrackHit,
+} from "./types";
 
 /** Fill videoIds into metadata-only hits (client-side matcher, session-cached). */
-async function attachMatches(hits: SpTrackHit[]): Promise<SpTrackHit[]> {
+export async function attachMatches(hits: SpTrackHit[]): Promise<SpTrackHit[]> {
   const pending = hits.filter((t) => !t.videoId);
   if (pending.length === 0) return hits;
   const inputs: SpMatchInput[] = pending.map((t) => ({
@@ -41,7 +48,7 @@ async function attachMatches(hits: SpTrackHit[]): Promise<SpTrackHit[]> {
   });
 }
 
-let probe: { at: number; ok: boolean } | null = null;
+let probe: { at: number; ok: boolean; clientId: string } | null = null;
 
 export async function spotifyAvailable(): Promise<boolean> {
   const base = spotifyBridgeBase();
@@ -50,12 +57,18 @@ export async function spotifyAvailable(): Promise<boolean> {
   try {
     const res = await fetch(`${base}/status`, { cache: "no-store" });
     if (!res.ok) throw new Error(`status ${res.status}`);
-    const data = (await res.json()) as { configured?: boolean };
-    probe = { at: Date.now(), ok: !!data.configured };
+    const data = (await res.json()) as { configured?: boolean; clientId?: string };
+    probe = { at: Date.now(), ok: !!data.configured, clientId: data.clientId ?? "" };
   } catch {
-    probe = { at: Date.now(), ok: false };
+    probe = { at: Date.now(), ok: false, clientId: "" };
   }
   return probe.ok;
+}
+
+/** The PUBLIC application id (safe to embed — PKCE involves no secret), used
+ *  by the in-app Spotify login. Empty when the bridge is down/unconfigured. */
+export function spotifyClientId(): string {
+  return probe?.clientId ?? "";
 }
 
 export async function spotifySearch(q: string, signal?: AbortSignal): Promise<SpSearchResult> {
@@ -109,6 +122,18 @@ export async function spotifyRelated(artist: string): Promise<SpRelatedResult> {
       reason: e instanceof Error ? e.message : "related failed",
     };
   }
+}
+
+/** Full Spotify playlist page: metadata + track metadata, then matched here.
+ *  App-token endpoint (no login needed) — works for public/search playlists. */
+export async function spotifyPlaylistPage(id: string): Promise<SpPlaylistResult> {
+  const res = await fetch(`${spotifyBridgeBase()}/playlist?id=${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`spotify playlist ${res.status}`);
+  const data = (await res.json()) as SpPlaylistResult;
+  data.tracks = await attachMatches(data.tracks);
+  return data;
 }
 
 /**
