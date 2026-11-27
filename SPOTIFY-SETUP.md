@@ -36,8 +36,13 @@ involved; tokens stay in the app. Matching to YouTube happens in the app
 4. **User Management** (left sidebar of the app page): **Add the email of the
    Spotify account you will log in with.** In Development Mode ONLY these
    allow-listed users can sign in — skipping this makes the login fail.
-   (Up to 25 users; for a private app this IS the access control.)
-5. Copy the **Client ID** and **Client Secret** — they go into GitHub secrets
+   (Up to **5 users** since Spotify's February 2026 rules; for a private app
+   this IS the access control.)
+5. **The Spotify account that owns this app must be Premium.** Since
+   9 March 2026, Development-Mode apps whose account is on Spotify Free get
+   **403 refused** on catalog calls (search included) — see the policy
+   section below.
+6. Copy the **Client ID** and **Client Secret** — they go into GitHub secrets
    in step 2, nowhere else.
 
 ## Step 2 — Deploy the bridge (automatic, from GitHub)
@@ -82,14 +87,35 @@ Development Mode apps: `/recommendations` and related-artists answer **403**,
 - requesting **Extended Quota Mode** upgrades picks + related to the real
   engines with zero code changes.
 
+## 2026 Spotify policy — what changed and what Wave does about it
+
+Spotify tightened Development Mode twice (Nov 2024, then Feb/Mar 2026). The
+rules that apply to Wave today:
+
+| Rule | Effect on Wave |
+| --- | --- |
+| Development Mode requires a **Premium** Spotify account (since 9 Mar 2026, all dev-mode apps) | The account that owns the app AND every allow-listed login must be Premium. Free account → catalog calls (even search with a valid token) answer **403**. |
+| Max **5 allow-listed users** per app (was 25) | Fine — Wave is private; one email in User Management is enough. |
+| **One Development-Mode client** per developer | If you create another test app, the older one can stop working. Use only the `Wave` app. |
+| `/search` returns at most **10 items** per request; larger limits are rejected outright | The bridge now caps every search at 10 (this was the “Couldn't reach Spotify” bug — the old code asked for 20). |
+| `/recommendations`, related-artists, audio-features, preview URLs stay **closed** to dev-mode apps | Picks fall back to popularity-ranked search; fans-also-like hides. Nothing for you to do. |
+| Playback-control / full-track playback still needs Premium on the LISTENER account | Wave never plays from Spotify — audio stays YouTube — so this does not bite. |
+
 ## If "Couldn't reach Spotify" appears
 
-- The status call works (the tab exists) but a heavier call failed.
-- First search after a deploy/cold start is the slow one — try again once;
-  warm results cache for 10 minutes.
-- Matching happens ON DEVICE, so bridge calls are fast metadata-only reads —
-  if errors persist, check the Worker logs (Cloudflare dashboard → Workers →
-  wave-bridge → Logs) and that the repo secrets are still valid.
+The app now shows **Spotify's own reason** under the headline — read it:
+
+- **“…403… Premium… / not registered / allowlist”** → the app-level refusals
+  above: make the owning account Premium, and check the email is under
+  **User Management**. No rebuild needed — retry the search in-app after
+  fixing (the probe recovers within a minute).
+- **“Check your connection…” (no reason shown)** → genuine network/cold-start:
+  the first search after a deploy is the slow one — try again once; warm
+  results cache for 10 minutes.
+- Errors that persist → open the bridge URL directly in a browser:
+  `<bridge-url>/api/spotify/status` must answer `{"configured":true}` and
+  `<bridge-url>/api/spotify/search?q=veera` must return JSON (or the raw
+  Spotify error — which now names the exact problem).
 
 ## Files
 

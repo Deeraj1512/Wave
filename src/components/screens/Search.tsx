@@ -268,7 +268,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
   const [spAlbums, setSpAlbums] = useState<SpAlbumLite[]>([]);
   const [spPlaylists, setSpPlaylists] = useState<SpPlaylistLite[]>([]);
   const [spLoading, setSpLoading] = useState(false);
-  const [spError, setSpError] = useState(false);
+  const [spError, setSpError] = useState<string | null>(null);
   const [spOpening, setSpOpening] = useState<string | null>(null);
   useEffect(() => {
     if (tab !== "spotify") return;
@@ -281,7 +281,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
         setSpAlbums([]);
         setSpPlaylists([]);
         setSpLoading(false);
-        setSpError(false);
+        setSpError(null);
         return;
       }
       setSpLoading(true);
@@ -291,7 +291,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           setSpArtists(res.artists.slice(0, 8));
           setSpAlbums(res.albums.slice(0, 8));
           setSpPlaylists(res.playlists ?? []);
-          setSpError(false);
+          setSpError(null);
           setSpLoading(false);
         })
         .catch((e) => {
@@ -300,7 +300,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           setSpArtists([]);
           setSpAlbums([]);
           setSpPlaylists([]);
-          setSpError(true);
+          setSpError(e instanceof Error ? e.message : "spotify search failed");
           setSpLoading(false);
         });
     }, 400);
@@ -705,7 +705,7 @@ function SpotifyResults({
   albums: SpAlbumLite[];
   playlists: SpPlaylistLite[];
   loading: boolean;
-  failed: boolean;
+  failed: string | null;
   query: string;
   opening: string | null;
   openingPlaylist: string | null;
@@ -713,11 +713,20 @@ function SpotifyResults({
   onOpenPlaylist: (p: SpPlaylistLite) => void;
 }) {
   if (failed) {
+    const refused = /403|premium|not registered|allowlist|restriction/i.test(failed);
     return (
       <div className="py-16 text-center">
         <WifiOff className="mx-auto h-10 w-10 text-muted-foreground/50" />
         <p className="mt-4 text-lg font-bold">Couldn&apos;t reach Spotify</p>
-        <p className="mt-1 text-sm text-muted-foreground">Check your connection and try again — your query is still in the box.</p>
+        {refused ? (
+          <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
+            Spotify refused the request{failed ? ` — ${failed}` : ""}. A Development-Mode app must
+            belong to a Premium Spotify account, and the account email has to be added under User
+            Management on the Spotify dashboard.
+          </p>
+        ) : (
+          <p className="mt-1 text-sm text-muted-foreground">Check your connection and try again — your query is still in the box.</p>
+        )}
       </div>
     );
   }

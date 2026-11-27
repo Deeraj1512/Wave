@@ -73,7 +73,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ configured: false, tracks: [], artists: [], albums: [], playlists: [] });
   }
   const market = req.nextUrl.searchParams.get("market") || "IN";
-  const limit = Math.min(30, Math.max(1, parseInt(req.nextUrl.searchParams.get("limit") || "20", 10) || 20));
+  // Spotify caps /search at 10 results per request (February 2026 change) —
+  // anything larger is rejected outright, which surfaced in the app as
+  // "Couldn't reach Spotify". Cap here so the bridge can never over-ask.
+  const limit = Math.min(10, Math.max(1, parseInt(req.nextUrl.searchParams.get("limit") || "10", 10) || 10));
 
   const key = `${q.toLowerCase()}|${limit}|${market}`;
   const hit = cache.get(key);

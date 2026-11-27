@@ -53,7 +53,11 @@ function accessToken(): Promise<string> {
       cache: "no-store",
     });
     if (!res.ok) {
-      throw new SpotifyUnavailableError(res.status, `spotify token ${res.status}`);
+      const body = await res.text().catch(() => "");
+      throw new SpotifyUnavailableError(
+        res.status,
+        `spotify token ${res.status}${body ? `: ${body.slice(0, 240)}` : ""}`
+      );
     }
     const data = (await res.json()) as { access_token: string; expires_in: number };
     cachedToken = {
@@ -79,7 +83,22 @@ export async function spotifyApi<T>(path: string): Promise<T> {
     throw new SpotifyUnavailableError(401, "spotify token rejected");
   }
   if (!res.ok) {
-    throw new SpotifyUnavailableError(res.status, `spotify ${res.status} for ${path}`);
+    // Surface Spotify's OWN error body — it carries the real reason
+    // ("You need a Premium account…", "restrictions violated", rate-limit
+    // text). Without this a 403 reached the app as a bare status code and
+    // the user just saw "Couldn't reach Spotify" with no way to know why.
+    const body = await res.text().catch(() => "");
+    let detail = "";
+    try {
+      detail = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
+    } catch {
+      detail = body;
+    }
+    detail = detail.trim().slice(0, 240);
+    throw new SpotifyUnavailableError(
+      res.status,
+      `spotify ${res.status} for ${path}${detail ? `: ${detail}` : ""}`
+    );
   }
   return (await res.json()) as T;
 }

@@ -49,11 +49,15 @@ export async function attachMatches(hits: SpTrackHit[]): Promise<SpTrackHit[]> {
 }
 
 let probe: { at: number; ok: boolean; clientId: string } | null = null;
+const PROBE_OK_TTL = 10 * 60 * 1000;
+// A failed probe must NOT stick around for 10 minutes — after the owner fixes
+// credentials / account state, the tab should recover within a minute.
+const PROBE_FAIL_TTL = 60 * 1000;
 
 export async function spotifyAvailable(): Promise<boolean> {
   const base = spotifyBridgeBase();
   if (!base) return false;
-  if (probe && Date.now() - probe.at < 10 * 60 * 1000) return probe.ok;
+  if (probe && Date.now() - probe.at < (probe.ok ? PROBE_OK_TTL : PROBE_FAIL_TTL)) return probe.ok;
   try {
     const res = await fetch(`${base}/status`, { cache: "no-store" });
     if (!res.ok) throw new Error(`status ${res.status}`);
@@ -71,12 +75,43 @@ export function spotifyClientId(): string {
   return probe?.clientId ?? "";
 }
 
+/** fetch with a hard timeout — a WebView fetch to a cold serverless bridge
+ *  can otherwise hang indefinitely and leave the tab spinning. */
+async function fetchTimeout(url: string, init: RequestInit = {}, ms = 30000): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  const onOuterAbort = () => ctrl.abort();
+  if (init.signal) {
+    if (init.signal.aborted) ctrl.abort();
+    else init.signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+    init.signal?.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+/** Build the error for a non-OK bridge response. The bridge puts Spotify's
+ *  own reason (403 body, rate-limit text…) into `error` — carry it through so
+ *  the UI can say WHY instead of a bare "Couldn't reach Spotify". */
+async function bridgeError(res: Response, what: string): Promise<Error> {
+  try {
+    const data = (await res.json()) as { error?: string };
+    if (data?.error) return new Error(data.error);
+  } catch {
+    /* body wasn't JSON — fall through */
+  }
+  return new Error(`spotify ${what} ${res.status}`);
+}
+
 export async function spotifySearch(q: string, signal?: AbortSignal): Promise<SpSearchResult> {
-  const res = await fetch(`${spotifyBridgeBase()}/search?q=${encodeURIComponent(q)}`, {
+  const res = await fetchTimeout(`${spotifyBridgeBase()}/search?q=${encodeURIComponent(q)}`, {
     signal,
     cache: "no-store",
   });
-  if (!res.ok) throw new Error(`spotify search ${res.status}`);
+  if (!res.ok) throw await bridgeError(res, "search");
   const data = (await res.json()) as SpSearchResult;
   if (!data.configured) return data;
   data.tracks = await attachMatches(data.tracks);
@@ -93,7 +128,7 @@ export async function spotifyPicks(
   if (genres.length) p.set("genres", genres.join(","));
   p.set("limit", String(limit));
   try {
-    const res = await fetch(`${spotifyBridgeBase()}/picks?${p.toString()}`, { cache: "no-store" });
+    const res = await fetchTimeout(`${spotifyBridgeBase()}/picks?${p.toString()}`, { cache: "no-store" });
     if (!res.ok) throw new Error(`picks ${res.status}`);
     const data = (await res.json()) as SpPicksResult;
     if (data.available) data.tracks = await attachMatches(data.tracks);
@@ -110,7 +145,7 @@ export async function spotifyPicks(
 
 export async function spotifyRelated(artist: string): Promise<SpRelatedResult> {
   try {
-    const res = await fetch(`${spotifyBridgeBase()}/related?artist=${encodeURIComponent(artist)}`, {
+    const res = await fetchTimeout(`${spotifyBridgeBase()}/related?artist=${encodeURIComponent(artist)}`, {
       cache: "no-store",
     });
     if (!res.ok) throw new Error(`related ${res.status}`);
@@ -127,10 +162,10 @@ export async function spotifyRelated(artist: string): Promise<SpRelatedResult> {
 /** Full Spotify playlist page: metadata + track metadata, then matched here.
  *  App-token endpoint (no login needed) — works for public/search playlists. */
 export async function spotifyPlaylistPage(id: string): Promise<SpPlaylistResult> {
-  const res = await fetch(`${spotifyBridgeBase()}/playlist?id=${encodeURIComponent(id)}`, {
+  const res = await fetchTimeout(`${spotifyBridgeBase()}/playlist?id=${encodeURIComponent(id)}`, {
     cache: "no-store",
   });
-  if (!res.ok) throw new Error(`spotify playlist ${res.status}`);
+  if (!res.ok) throw await bridgeError(res, "playlist");
   const data = (await res.json()) as SpPlaylistResult;
   data.tracks = await attachMatches(data.tracks);
   return data;
