@@ -1,8 +1,0 @@
-# Wave Spotify bridge — Cloudflare Worker config.
-# Deployed by .github/workflows/deploy-bridge.yml (push to main touching
-# bridge/**, or manual "Run workflow"). Secrets SPOTIFY_CLIENT_ID /
-# SPOTIFY_CLIENT_SECRET are pushed as Worker secrets by the same workflow —
-# they are NEVER committed here and NEVER baked into the APK.
-name = "wave-bridge"
-main = "src/index.ts"
-compatibility_date = "2025-03-01"
