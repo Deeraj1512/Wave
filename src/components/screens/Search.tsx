@@ -1,29 +1,26 @@
 "use client";
 
-import { useMemo, useRef, useState, useEffect, useSyncExternalStore } from "react";
-import { Clock, Disc3, ListMusic, Loader2, LogIn, LogOut, Music2, Play, Search, WifiOff, X } from "lucide-react";
+import { useMemo, useRef, useState, useEffect } from "react";
+import { Clock, Disc3, Loader2, Mic2, Play, Search, WifiOff, X } from "lucide-react";
 import { TrackRow } from "../TrackRow";
 import { Cover } from "../Cover";
-import { usePlayer } from "@/lib/player";
 import { GENRE_TILES } from "@/lib/data";
-import { searchFullApi, albumSearchApi, albumBrowseApi, suggestApi, type ApiAlbum } from "@/lib/api";
+import {
+  searchFullApi,
+  albumSearchApi,
+  albumBrowseApi,
+  artistSearchApi,
+  suggestApi,
+  apiTrackToTrack,
+  type ApiAlbum,
+  type ApiArtistEntity,
+  type ApiTopEntity,
+} from "@/lib/api";
 import { groupAlbums, registerAlbum } from "@/lib/albums";
 import { useToast } from "@/hooks/use-toast";
+import { usePlayer } from "@/lib/player";
 import type { Track } from "@/lib/types";
-import {
-  spotifyAvailable,
-  spotifyHitToTrack,
-  spotifyPicks,
-  spotifyPlaylistPage,
-  spotifyRelated,
-  spotifySearch,
-} from "@/lib/spotify/bridge";
-import type { SpAlbumLite, SpArtistLite, SpPlaylistLite, SpPlaylistResult, SpTrackHit } from "@/lib/spotify/types";
-import { spotifyLoggedIn, spotifyLogin, spotifyLogout, spotifyUserEmail, subscribeUserAuth } from "@/lib/spotify/userAuth";
-import { spotifySavedTracks, spotifyTopArtists, spotifyTopTracks, spotifyUserPlaylists } from "@/lib/spotify/user";
 import { goToArtist } from "@/lib/goToArtist";
-import { recentPlays, topArtists } from "@/lib/history";
-import { rankedTasteLangs } from "@/lib/profile";
 import { AlbumView } from "./AlbumView";
 
 const RECENT_KEY = "dhun.recentSearches";
@@ -75,8 +72,19 @@ interface AlbumCard {
   count?: number;
 }
 
+/** Diacritic-strip + lowercase + whitespace collapse — stable keys for entities. */
+function foldKey(s: string): string {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string; seedKey?: number }) {
   const { toast } = useToast();
+  const { playRadio } = usePlayer();
   const [q, setQ] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -111,38 +119,38 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
 
   // Real search through the Wave backend — no mock fallback. A failed search shows
   // an honest error (scoped to the query it failed for) instead of fake results.
-  // Result tabs — "Songs" is the classic track list, "Albums" narrows to album
-  // cards, "Spotify" switches the whole view to the Spotify bridge (declared
-  // here because both search effects read it in their deps).
+  // One request feeds ALL three tabs (YTM page model): songs + album entities +
+  // artist entities + YTM's own top-result card. Tab switching never refetches.
   const [results, setResults] = useState<Track[]>([]);
   const [albumEntities, setAlbumEntities] = useState<ApiAlbum[]>([]);
+  const [artistEntities, setArtistEntities] = useState<ApiArtistEntity[]>([]);
+  const [top, setTop] = useState<ApiTopEntity | null>(null);
   const [searching, setSearching] = useState(false);
   const [failure, setFailure] = useState<{ q: string } | null>(null);
-  const [tab, setTab] = useState<"songs" | "albums" | "spotify">("songs");
-  // Spotify playlist page — rendered in-tab like the album view (both the
-  // search-results cards and the user-playlists cards open here).
-  const [spPlaylist, setSpPlaylist] = useState<SpPlaylistResult | null>(null);
-  const [spPlOpening, setSpPlOpening] = useState<string | null>(null);
-  const switchTab = (t: "songs" | "albums" | "spotify") => {
+  const [tab, setTab] = useState<"songs" | "albums" | "artists">("songs");
+  const switchTab = (t: "songs" | "albums" | "artists") => {
     setTab(t);
     if (openAlbum) setOpenAlbum(null); // leaving the album page via the tabs
-    if (spPlaylist) setSpPlaylist(null); // leaving the playlist page via the tabs
   };
   useEffect(() => {
     const query = q.trim();
     const ctrl = new AbortController();
     const t = setTimeout(() => {
-      if (!query || tab === "spotify") {
+      if (!query) {
         setResults([]);
         setAlbumEntities([]);
+        setArtistEntities([]);
+        setTop(null);
         setSearching(false);
         return;
       }
       setSearching(true);
       searchFullApi(query, ctrl.signal)
-        .then(({ tracks, albums }) => {
+        .then(({ tracks, albums, artists, top: card }) => {
           setResults(tracks);
           setAlbumEntities(albums);
+          setArtistEntities(artists);
+          setTop(card);
           setFailure(null);
           setSearching(false);
         })
@@ -150,6 +158,8 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           if (e?.name === "AbortError") return;
           setResults([]);
           setAlbumEntities([]);
+          setArtistEntities([]);
+          setTop(null);
           setFailure({ q: query });
           setSearching(false);
         });
@@ -159,7 +169,7 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
       ctrl.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, tab]);
+  }, [q]);
 
   // ── Suggestions — YouTube's typing behavior: 2 letters in, the song comes
   //    back as a tappable completion. Never blocks or breaks search. ──
@@ -247,151 +257,6 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
     }
   };
 
-  // ── Spotify mode (Phase 1) — the third tab. Everything Spotify happens on
-  //    the server bridge (the client secret never leaves it); tracks arrive
-  //    already matched to playable videoIds, so playback/queue/radio run the
-  //    EXISTING pipeline. With no bridge configured the tab simply never
-  //    appears — zero behavior change for a pure-YTM deployment.
-  const [spOk, setSpOk] = useState<boolean | null>(null);
-  useEffect(() => {
-    let alive = true;
-    spotifyAvailable()
-      .then((ok) => alive && setSpOk(ok))
-      .catch(() => alive && setSpOk(false));
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  const [spHits, setSpHits] = useState<SpTrackHit[]>([]);
-  const [spArtists, setSpArtists] = useState<SpArtistLite[]>([]);
-  const [spAlbums, setSpAlbums] = useState<SpAlbumLite[]>([]);
-  const [spPlaylists, setSpPlaylists] = useState<SpPlaylistLite[]>([]);
-  const [spLoading, setSpLoading] = useState(false);
-  const [spError, setSpError] = useState<string | null>(null);
-  const [spOpening, setSpOpening] = useState<string | null>(null);
-  useEffect(() => {
-    if (tab !== "spotify") return;
-    const query = q.trim();
-    const ctrl = new AbortController();
-    const t = setTimeout(() => {
-      if (!query) {
-        setSpHits([]);
-        setSpArtists([]);
-        setSpAlbums([]);
-        setSpPlaylists([]);
-        setSpLoading(false);
-        setSpError(null);
-        return;
-      }
-      setSpLoading(true);
-      spotifySearch(query, ctrl.signal)
-        .then((res) => {
-          setSpHits(res.tracks);
-          setSpArtists(res.artists.slice(0, 8));
-          setSpAlbums(res.albums.slice(0, 8));
-          setSpPlaylists(res.playlists ?? []);
-          setSpError(null);
-          setSpLoading(false);
-        })
-        .catch((e) => {
-          if (e?.name === "AbortError") return;
-          setSpHits([]);
-          setSpArtists([]);
-          setSpAlbums([]);
-          setSpPlaylists([]);
-          setSpError(e instanceof Error ? e.message : "spotify search failed");
-          setSpLoading(false);
-        });
-    }, 400);
-    return () => {
-      clearTimeout(t);
-      ctrl.abort();
-    };
-  }, [q, tab]);
-
-  // Spotify albums don't get their own page family — an album tap matches the
-  // Spotify album to its REAL YouTube album (entity search + /browse, the same
-  // ladder openCard uses) and opens the existing album page with its full
-  // official tracklist. One browse roundtrip — real YTM credits and art.
-  const foldKey = (s: string): string =>
-    (s || "")
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim();
-  const openSpAlbum = async (a: SpAlbumLite) => {
-    if (spOpening || openingKey) return;
-    setSpOpening(a.id);
-    try {
-      const entities = await albumSearchApi(a.title, a.artist || undefined);
-      let page: Awaited<ReturnType<typeof albumBrowseApi>> = null;
-      for (const e of entities.slice(0, 3)) {
-        const et = foldKey(e.title);
-        const at = foldKey(a.title);
-        if (
-          !et ||
-          !at ||
-          !(et === at || (et.length >= 4 && et.includes(at)) || (at.length >= 4 && at.includes(et)))
-        )
-          continue;
-        const p = await albumBrowseApi(e.browseId).catch(() => null);
-        if (p && p.tracks.length > 0) {
-          page = p;
-          break;
-        }
-      }
-      if (!page) throw new Error("no ytm album");
-      const pageKey = foldKey(page.album.title);
-      if (!pageKey) throw new Error("bad key");
-      registerAlbum(pageKey, page.tracks);
-      const spKey = foldKey(a.title);
-      if (spKey && spKey !== pageKey) registerAlbum(spKey, page.tracks);
-      setOpenAlbum({ key: pageKey, q });
-      commitRecent(q);
-    } catch {
-      toast({
-        title: "Couldn't open this album",
-        description: "No YouTube album matched this Spotify album",
-        duration: 3000,
-      });
-    } finally {
-      setSpOpening(null);
-    }
-  };
-
-  // Spotify playlist page (in-tab). The bridge returns metadata + matched
-  // tracks (matching rides the app's own YTM chain inside spotifyPlaylistPage).
-  const openSpPlaylist = async (p: SpPlaylistLite) => {
-    if (spPlOpening) return;
-    setSpPlOpening(p.id);
-    try {
-      const page = await spotifyPlaylistPage(p.id);
-      setSpPlaylist(page);
-      commitRecent(q);
-    } catch {
-      toast({
-        title: "Couldn't open this playlist",
-        description: "The bridge couldn't load it — try again in a moment",
-        duration: 3000,
-      });
-    } finally {
-      setSpPlOpening(null);
-    }
-  };
-
-  // Pinned album on the Songs tab — when the query IS an album name and an
-  // entity matched, the album surfaces FIRST (like YTM's top-result card).
-  const pinned: ApiAlbum | undefined = useMemo(() => {
-    const query = q.trim().toLowerCase();
-    if (query.length < 3) return undefined;
-    return albumEntities.find((a) => {
-      const n = a.title.toLowerCase();
-      return n === query || (n.length >= 4 && n.includes(query)) || (query.length >= 4 && query.includes(n));
-    });
-  }, [albumEntities, q]);
-
   // Albums tab with nothing? One dedicated entity search for the typed name —
   // "type the album, find the album" must always work, even when the song
   // search short-circuited confident (albums shelf absent).
@@ -413,10 +278,70 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, q, searching, albumCards.length]);
 
-  // The tab row always renders — the Spotify chip must be discoverable on the
-  // empty browse view too (that's where its picks shelf lives).
-  const tabs: Array<"songs" | "albums" | "spotify"> = spOk ? ["songs", "albums", "spotify"] : ["songs", "albums"];
-  const onSpotify = tab === "spotify";
+  // Artists tab with nothing? Same dedicated-lane rule as albums: one extra
+  // artist-entity search so "type the artist, find the artist" always works.
+  const lastArtistQuery = useRef<string>("");
+  useEffect(() => {
+    const query = q.trim();
+    if (tab !== "artists" || artistEntities.length > 0 || !query || searching) return;
+    if (lastArtistQuery.current === query) return;
+    lastArtistQuery.current = query;
+    let alive = true;
+    artistSearchApi(query)
+      .then((list) => {
+        if (alive && list.length > 0) setArtistEntities((prev) => (prev.length > 0 ? prev : list));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, q, searching, artistEntities.length]);
+
+  // Dedupe artist entities by folded name (card artist + row artists can repeat)
+  const artistCards = useMemo(() => {
+    const seen = new Set<string>();
+    const out: ApiArtistEntity[] = [];
+    for (const a of artistEntities) {
+      const k = foldKey(a.name);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(a);
+      if (out.length >= 12) break;
+    }
+    return out;
+  }, [artistEntities]);
+
+  // The top-result card opens its album through the same browse roundtrip —
+  // synthesize an AlbumCard so openCard handles loading + error toasts.
+  const topAlbumCard: AlbumCard | null =
+    top?.kind === "album" && top.browseId
+      ? { key: foldKey(top.name), name: top.name, artist: top.subtitle.split("•")[0]?.trim() || undefined, year: top.subtitle.match(/\b(19|20)\d{2}\b/)?.[0], thumb: top.thumb, browseId: top.browseId }
+      : null;
+
+  // The top-result card for a song/video plays immediately (the seed track first,
+  // then its radio — the same semantics every row tap uses).
+  const playTopSong = (entity: ApiTopEntity) => {
+    if (!entity.videoId) return;
+    const matched = results.find((t) => t.id === entity.videoId);
+    const artistGuess = entity.subtitle.split("•")[0]?.trim() ?? "";
+    const track: Track =
+      matched ??
+      apiTrackToTrack({
+        videoId: entity.videoId,
+        title: entity.name,
+        artist: artistGuess,
+        album: "",
+        durationSec: 0,
+        views: 0,
+        tier: 1,
+        thumb: entity.thumb,
+      });
+    playRadio(track, `${track.title} radio`);
+    commitRecent(q);
+  };
+
+  const tabs: Array<"songs" | "albums" | "artists"> = ["songs", "albums", "artists"];
 
   return (
     <div className="space-y-8 pb-8">
@@ -473,38 +398,21 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
                   : "rounded-full border border-border bg-surface-2 px-4 py-1.5 text-[13px] font-semibold text-foreground/80 transition hover:bg-surface-3"
               }
             >
-              {t === "songs" ? "Songs" : t === "albums" ? "Albums" : "Spotify"}
+              {t === "songs" ? "Songs" : t === "albums" ? "Albums" : "Artists"}
             </button>
           ))}
-          {(onSpotify ? spLoading : searching) && (
+          {searching && (
             <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" aria-label="Searching" />
           )}
         </div>
       </div>
 
-      {onSpotify && spPlaylist ? (
-        // ── Spotify playlist page (in-tab, above any query state) ──
-        <SpPlaylistView page={spPlaylist} onBack={() => setSpPlaylist(null)} />
-      ) : q.trim() ? (
+      {q.trim() ? (
         // ── Results view ── (any result tap commits the current query to recents)
         <div onClickCapture={() => commitRecent()}>
         {albumOpen ? (
           <AlbumView id={albumOpen} onBack={() => setOpenAlbum(null)} />
-        ) : onSpotify ? (
-          <SpotifyResults
-            hits={spHits}
-            artists={spArtists}
-            albums={spAlbums}
-            playlists={spPlaylists}
-            loading={spLoading}
-            failed={spError}
-            query={q.trim()}
-            opening={spOpening}
-            openingPlaylist={spPlOpening}
-            onOpenAlbum={(a) => void openSpAlbum(a)}
-            onOpenPlaylist={(p) => void openSpPlaylist(p)}
-          />
-        ) : searching && results.length === 0 ? (
+        ) : searching && results.length === 0 && albumCards.length === 0 && artistCards.length === 0 && !top ? (
           <div className="space-y-2 py-6">
             {Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="flex items-center gap-4 rounded-xl px-3 py-2">
@@ -522,101 +430,125 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
             <p className="mt-4 text-lg font-bold">Couldn&apos;t search just now</p>
             <p className="mt-1 text-sm text-muted-foreground">Check your connection and try again — your query is still in the box.</p>
           </div>
-        ) : results.length > 0 || albumCards.length > 0 ? (
-          tab === "albums" ? (
-            albumCards.length > 0 ? (
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-                {albumCards.map((a) => (
-                  <button
-                    key={a.key}
-                    onClick={() => void openCard(a)}
-                    disabled={!!openingKey}
-                    className="group rounded-2xl p-3 text-left transition hover:bg-surface-2"
-                    aria-label={`Open album ${a.name}`}
-                  >
-                    <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30">
-                      {a.thumb || a.cover ? (
-                        <img src={(a.thumb ?? a.cover)!} alt="" className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]" />
-                      ) : (
-                        <Cover from={a.colors![0]} to={a.colors![1]} seed={a.seed!} className="h-full w-full" />
-                      )}
-                      <span className="absolute inset-0 flex items-end justify-start bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
-                        <span className="flex h-10 w-10 m-3 items-center justify-center rounded-full bg-[var(--accent)] shadow-xl">
-                          {openingKey === a.key ? (
-                            <Loader2 className="h-4 w-4 animate-spin text-black" />
-                          ) : (
-                            <Play className="h-4 w-4 fill-black text-black" />
-                          )}
-                        </span>
-                      </span>
-                    </span>
-                    <span className="mt-2.5 flex items-center gap-1.5">
-                      <Disc3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Album</span>
-                    </span>
-                    <span className="mt-0.5 block truncate text-sm font-bold text-foreground">{a.name}</span>
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {a.artist ? `${a.artist} · ` : ""}
-                      {a.year ? `${a.year} · ` : ""}
-                      {a.count !== undefined ? `${a.count} song${a.count === 1 ? "" : "s"}` : "Album"}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="py-16 text-center">
-                <Disc3 className="mx-auto h-10 w-10 text-muted-foreground/50" />
-                <p className="mt-4 text-lg font-bold">No albums for “{q}”</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  This search matched songs only —{" "}
-                  <button onClick={() => setTab("songs")} className="font-semibold text-[var(--accent)] underline underline-offset-2">
-                    see songs
-                  </button>
-                </p>
-              </div>
-            )
-          ) : (
-            <div className="space-y-4">
-              {/* pinned album — the query named an album, show it first */}
-              {pinned && !albumOpen && (
+        ) : tab === "albums" ? (
+          albumCards.length > 0 ? (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+              {albumCards.map((a) => (
                 <button
-                  onClick={() => void openCard({ key: pinned.title.toLowerCase(), name: pinned.title, artist: pinned.artist, thumb: pinned.thumb, browseId: pinned.browseId })}
+                  key={a.key}
+                  onClick={() => void openCard(a)}
                   disabled={!!openingKey}
-                  className="flex w-full items-center gap-4 rounded-2xl border border-border bg-surface-2 p-3 text-left transition hover:bg-surface-3"
+                  className="group rounded-2xl p-3 text-left transition hover:bg-surface-2"
+                  aria-label={`Open album ${a.name}`}
                 >
-                  <span className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl">
-                    {pinned.thumb ? (
-                      <img src={pinned.thumb} alt="" className="h-full w-full object-cover" />
+                  <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30">
+                    {a.thumb || a.cover ? (
+                      <img src={(a.thumb ?? a.cover)!} alt="" className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]" />
                     ) : (
-                      <span className="flex h-full w-full items-center justify-center bg-surface-3">
-                        <Disc3 className="h-6 w-6 text-muted-foreground" />
-                      </span>
+                      <Cover from={a.colors![0]} to={a.colors![1]} seed={a.seed!} className="h-full w-full" />
                     )}
-                    {openingKey === pinned.title.toLowerCase() && (
-                      <span className="absolute inset-0 flex items-center justify-center bg-black/50">
-                        <Loader2 className="h-4 w-4 animate-spin text-white" />
+                    <span className="absolute inset-0 flex items-end justify-start bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
+                      <span className="flex h-10 w-10 m-3 items-center justify-center rounded-full bg-[var(--accent)] shadow-xl">
+                        {openingKey === a.key ? (
+                          <Loader2 className="h-4 w-4 animate-spin text-black" />
+                        ) : (
+                          <Play className="h-4 w-4 fill-black text-black" />
+                        )}
                       </span>
-                    )}
+                    </span>
                   </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-1.5">
-                      <Disc3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Album</span>
-                    </span>
-                    <span className="mt-0.5 block truncate text-sm font-bold text-foreground">{pinned.title}</span>
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {pinned.artist ? `${pinned.artist} · ` : ""}Tap to open the full album
-                    </span>
+                  <span className="mt-2.5 flex items-center gap-1.5">
+                    <Disc3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Album</span>
+                  </span>
+                  <span className="mt-0.5 block truncate text-sm font-bold text-foreground">{a.name}</span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {a.artist ? `${a.artist} · ` : ""}
+                    {a.year ? `${a.year} · ` : ""}
+                    {a.count !== undefined ? `${a.count} song${a.count === 1 ? "" : "s"}` : "Album"}
                   </span>
                 </button>
-              )}
-              <div className="space-y-0.5">
-                {results.map((t) => (
-                  <TrackRow key={t.id} track={t} radio />
-                ))}
-              </div>
+              ))}
+            </div>
+          ) : (
+            <div className="py-16 text-center">
+              <Disc3 className="mx-auto h-10 w-10 text-muted-foreground/50" />
+              <p className="mt-4 text-lg font-bold">No albums for “{q}”</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                This search matched songs only —{" "}
+                <button onClick={() => setTab("songs")} className="font-semibold text-[var(--accent)] underline underline-offset-2">
+                  see songs
+                </button>
+              </p>
             </div>
           )
+        ) : tab === "artists" ? (
+          artistCards.length > 0 ? (
+            <div className="grid grid-cols-3 gap-x-3 gap-y-6 sm:grid-cols-4 lg:grid-cols-6">
+              {artistCards.map((a) => (
+                <button
+                  key={a.browseId ?? a.name}
+                  onClick={() => goToArtist(a.name)}
+                  className="group flex flex-col items-center gap-2 text-center"
+                  aria-label={`Open artist ${a.name}`}
+                >
+                  <span className="relative block aspect-square w-full overflow-hidden rounded-full border border-border bg-surface-2 shadow-lg shadow-black/20">
+                    {a.thumb ? (
+                      <img src={a.thumb} alt="" loading="lazy" className="h-full w-full object-cover transition-transform group-hover:scale-[1.05]" />
+                    ) : (
+                      <span className="flex h-full w-full items-center justify-center text-xl font-black text-muted-foreground">
+                        {a.name.slice(0, 1).toUpperCase()}
+                      </span>
+                    )}
+                  </span>
+                  <span className="w-full">
+                    <span className="block truncate text-[13px] font-bold text-foreground">{a.name}</span>
+                    <span className="block truncate text-[11px] text-muted-foreground">{a.subtitle || "Artist"}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="py-16 text-center">
+              <Mic2 className="mx-auto h-10 w-10 text-muted-foreground/50" />
+              <p className="mt-4 text-lg font-bold">No artists for “{q}”</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Try the artist&apos;s full name —{" "}
+                <button onClick={() => setTab("songs")} className="font-semibold text-[var(--accent)] underline underline-offset-2">
+                  see songs
+                </button>
+              </p>
+            </div>
+          )
+        ) : results.length > 0 || top ? (
+          <div className="space-y-4">
+            {/* YTM's top-result card — the artist/album/song YouTube Music itself pins
+                above every result ("om" → the O.M: Operation Mole album card) */}
+            {top && (
+              <TopResultCard
+                top={top}
+                opening={!!openingKey && openingKey === topAlbumCard?.key}
+                onOpenAlbum={topAlbumCard ? () => void openCard(topAlbumCard) : undefined}
+                onPlay={() => playTopSong(top)}
+                onOpenArtist={() => {
+                  goToArtist(top.name);
+                  commitRecent(q);
+                }}
+              />
+            )}
+            {results.length > 0 && (
+              <section aria-label="Songs">
+                {top && (
+                  <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Songs</h2>
+                )}
+                <div className="space-y-0.5">
+                  {results.map((t) => (
+                    <TrackRow key={t.id} track={t} radio />
+                  ))}
+                </div>
+              </section>
+            )}
+          </div>
         ) : (
           <div className="py-16 text-center">
             <Search className="mx-auto h-10 w-10 text-muted-foreground/50" />
@@ -625,9 +557,6 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
           </div>
         )}
         </div>
-      ) : onSpotify ? (
-        // ── Spotify picks (Phase 3) — the empty-state shelf of the Spotify tab ──
-        <SpotifyPicksPanel active onOpenPlaylist={(p) => void openSpPlaylist(p)} />
       ) : (
         // ── Browse view ──
         <div className="space-y-9">
@@ -679,619 +608,77 @@ export function SearchScreen({ initialQuery, seedKey }: { initialQuery?: string;
   );
 }
 
-// ── Spotify results view (Phase 1) ───────────────────────────────────────────
-// Pure presentation over bridge data — hooks stay in SearchScreen. Artist taps
-// open the EXISTING per-artist page (goToArtist); album taps resolve to the
-// existing YTM album page via openSpAlbum; matched songs are first-class
-// Tracks (queue, radio, likes, history all work). Unmatched tracks render
-// dimmed and non-interactive — a wrong videoId is worse than an honest
-// "no YouTube match".
+// ── Top result card (YTM page model, batch18) ────────────────────────────────
+// The one entity YouTube Music pins above every result list. Taps route by
+// kind: album → the existing album page (one browse roundtrip), artist → the
+// existing artist page, song/video → straight into playback (seed track + its
+// radio, same as any row tap).
 
-function SpotifyResults({
-  hits,
-  artists,
-  albums,
-  playlists,
-  loading,
-  failed,
-  query,
+function TopResultCard({
+  top,
   opening,
-  openingPlaylist,
   onOpenAlbum,
-  onOpenPlaylist,
+  onPlay,
+  onOpenArtist,
 }: {
-  hits: SpTrackHit[];
-  artists: SpArtistLite[];
-  albums: SpAlbumLite[];
-  playlists: SpPlaylistLite[];
-  loading: boolean;
-  failed: string | null;
-  query: string;
-  opening: string | null;
-  openingPlaylist: string | null;
-  onOpenAlbum: (a: SpAlbumLite) => void;
-  onOpenPlaylist: (p: SpPlaylistLite) => void;
+  top: ApiTopEntity;
+  opening: boolean;
+  onOpenAlbum?: () => void;
+  onPlay: () => void;
+  onOpenArtist: () => void;
 }) {
-  if (failed) {
-    const refused = /403|premium|not registered|allowlist|restriction/i.test(failed);
-    return (
-      <div className="py-16 text-center">
-        <WifiOff className="mx-auto h-10 w-10 text-muted-foreground/50" />
-        <p className="mt-4 text-lg font-bold">Couldn&apos;t reach Spotify</p>
-        {refused ? (
-          <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
-            Spotify refused the request{failed ? ` — ${failed}` : ""}. A Development-Mode app must
-            belong to a Premium Spotify account, and the account email has to be added under User
-            Management on the Spotify dashboard.
-          </p>
-        ) : (
-          <p className="mt-1 text-sm text-muted-foreground">Check your connection and try again — your query is still in the box.</p>
-        )}
-      </div>
-    );
-  }
-  const empty = hits.length === 0 && artists.length === 0 && albums.length === 0 && playlists.length === 0;
-  if (empty && !loading) {
-    return (
-      <div className="py-16 text-center">
-        <Search className="mx-auto h-10 w-10 text-muted-foreground/50" />
-        <p className="mt-4 text-lg font-bold">No Spotify results for &ldquo;{query}&rdquo;</p>
-        <p className="mt-1 text-sm text-muted-foreground">Try the Songs tab — it searches YouTube Music too.</p>
-      </div>
-    );
-  }
-  if (empty) {
-    return (
-      <div className="space-y-2 py-6">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="flex items-center gap-4 rounded-xl px-3 py-2">
-            <div className="h-12 w-12 shrink-0 animate-pulse rounded-lg bg-surface-3" />
-            <div className="flex-1 space-y-2">
-              <div className="h-3.5 w-1/3 animate-pulse rounded bg-surface-3" />
-              <div className="h-3 w-1/4 animate-pulse rounded bg-surface-2" />
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-7">
-      {artists.length > 0 && (
-        <section aria-label="Spotify artists">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Artists</h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-1">
-            {artists.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => goToArtist(a.name)}
-                className="flex w-20 shrink-0 flex-col items-center gap-2"
-                aria-label={`Open artist ${a.name}`}
-              >
-                <span className="h-20 w-20 overflow-hidden rounded-full border border-border bg-surface-2">
-                  {a.image ? (
-                    <img src={a.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center text-lg font-black text-muted-foreground">
-                      {a.name.slice(0, 1).toUpperCase()}
-                    </span>
-                  )}
-                </span>
-                <span className="w-full truncate text-center text-xs font-semibold text-foreground">{a.name}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {albums.length > 0 && (
-        <section aria-label="Spotify albums">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Albums</h2>
-          <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
-            {albums.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => onOpenAlbum(a)}
-                disabled={!!opening}
-                className="w-36 shrink-0 rounded-2xl p-2 text-left transition hover:bg-surface-2"
-                aria-label={`Open album ${a.title}`}
-              >
-                <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30">
-                  {a.image ? (
-                    <img src={a.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center bg-surface-3">
-                      <Disc3 className="h-6 w-6 text-muted-foreground" />
-                    </span>
-                  )}
-                  {opening === a.id && (
-                    <span className="absolute inset-0 flex items-center justify-center bg-black/50">
-                      <Loader2 className="h-4 w-4 animate-spin text-white" />
-                    </span>
-                  )}
-                </span>
-                <span className="mt-2 block truncate text-[13px] font-bold text-foreground">{a.title}</span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {[a.artist, a.year].filter(Boolean).join(" · ")}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {playlists.length > 0 && (
-        <section aria-label="Spotify playlists">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Playlists</h2>
-          <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
-            {playlists.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => onOpenPlaylist(p)}
-                disabled={!!openingPlaylist}
-                className="w-40 shrink-0 rounded-2xl p-2 text-left transition hover:bg-surface-2"
-                aria-label={`Open playlist ${p.title}`}
-              >
-                <span className="relative block aspect-square w-full overflow-hidden rounded-xl shadow-lg shadow-black/30 bg-surface-3">
-                  {p.image ? (
-                    <img src={p.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center bg-surface-3">
-                      <ListMusic className="h-6 w-6 text-muted-foreground" />
-                    </span>
-                  )}
-                  {openingPlaylist === p.id && (
-                    <span className="absolute inset-0 flex items-center justify-center bg-black/50">
-                      <Loader2 className="h-4 w-4 animate-spin text-white" />
-                    </span>
-                  )}
-                </span>
-                <span className="mt-2 block truncate text-[13px] font-bold text-foreground">{p.title}</span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {[p.owner, p.totalTracks ? `${p.totalTracks} songs` : ""].filter(Boolean).join(" \u00b7 ")}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {hits.length > 0 && (
-        <section aria-label="Spotify songs">
-          {(artists.length > 0 || albums.length > 0) && (
-            <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Songs</h2>
-          )}
-          <div className="space-y-0.5">
-            {hits.map((h) =>
-              h.videoId ? (
-                <TrackRow key={h.spotifyId} track={spotifyHitToTrack(h)} radio />
-              ) : (
-                <div key={`sp-${h.spotifyId}`} className="flex items-center gap-4 rounded-xl px-3 py-2 opacity-50">
-                  <span className="h-12 w-12 shrink-0 overflow-hidden rounded-lg bg-surface-3">
-                    {h.image ? <img src={h.image} alt="" loading="lazy" className="h-full w-full object-cover" /> : null}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-semibold text-foreground">{h.title}</span>
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {h.artist ? `${h.artist} · ` : ""}no YouTube match
-                    </span>
-                  </span>
-                </div>
-              )
-            )}
-          </div>
-        </section>
-      )}
-    </div>
-  );
-}
-
-// ── Spotify picks (Phase 3) ──────────────────────────────────────────────────
-// The empty-state shelf of the Spotify tab: recommendations seeded by what the
-// listener actually plays — top artists from listening history + taste
-// languages as genre seeds — plus "fans also like" artist chips from Spotify's
-// related-artists (hidden automatically while the app is quota-gated; dev-mode
-// apps don't have that endpoint yet). Picks themselves always render: the
-// bridge falls back to popularity-ranked search from the same seeds when
-// /recommendations is gated, so the shelf works in dev mode and upgrades to
-// real recommendations when Extended Quota lands. Cached 10 min per session —
-// tab switches stay instant.
-
-interface PicksData {
-  anchor?: string;
-  rows: SpTrackHit[];
-  related: SpArtistLite[];
-}
-
-/** The listener's OWN library (Phase 2) once PKCE-logged in. */
-interface UserData {
-  artists: SpArtistLite[];
-  top: SpTrackHit[];
-  saved: SpTrackHit[];
-  playlists: SpPlaylistLite[];
-}
-
-let picksCache: { at: number; data: PicksData } | null = null;
-let userCache: { at: number; data: UserData } | null = null;
-
-function SpotifyPicksPanel({
-  active,
-  onOpenPlaylist,
-}: {
-  active: boolean;
-  onOpenPlaylist: (p: SpPlaylistLite) => void;
-}) {
-  const [data, setData] = useState<PicksData | null>(() =>
-    picksCache && Date.now() - picksCache.at < 10 * 60 * 1000 ? picksCache.data : null
-  );
-  const [loading, setLoading] = useState(false);
-  const { toast } = useToast();
-
-  // ── My Spotify (Phase 2): the listener's own library once logged in ──
-  const loggedIn = useSyncExternalStore(subscribeUserAuth, spotifyLoggedIn, () => false);
-  const [userData, setUserData] = useState<UserData | null>(() =>
-    userCache && Date.now() - userCache.at < 10 * 60 * 1000 ? userCache.data : null
-  );
-  const [userLoading, setUserLoading] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const email = loggedIn ? spotifyUserEmail() : undefined;
-
-  const connect = async () => {
-    if (connecting) return;
-    setConnecting(true);
-    try {
-      await spotifyLogin(); // resolves after the browser round-trip
-    } catch (e) {
-      toast({
-        title: "Spotify sign-in didn't finish",
-        description:
-          e instanceof Error
-            ? e.message
-            : "Try again — make sure your account email is added under User Management in the Spotify dashboard",
-        duration: 4500,
-      });
-    } finally {
-      setConnecting(false);
-    }
+  const kindLabel = top.kind === "artist" ? "Artist" : top.kind === "album" ? "Album" : top.kind === "song" ? "Song" : "Video";
+  const Icon = top.kind === "artist" ? Mic2 : Disc3;
+  const handleTap = () => {
+    if (top.kind === "album") onOpenAlbum?.();
+    else if (top.kind === "artist") onOpenArtist();
+    else onPlay();
   };
-
-  useEffect(() => {
-    if (!active || data || loading) return;
-    let alive = true;
-    setLoading(true);
-    (async () => {
-      let seedArtists: string[] = [];
-      let seedGenres: string[] = [];
-      try {
-        seedArtists = topArtists(6).slice(0, 3);
-      } catch {
-        /* fresh install */
-      }
-      try {
-        const counts = new Map<string, number>();
-        for (const p of recentPlays(60)) {
-          if (p.lang) counts.set(p.lang, (counts.get(p.lang) ?? 0) + Math.max(1, p.n ?? 1));
-        }
-        seedGenres = rankedTasteLangs(counts)
-          .slice(0, 3)
-          .map((l) => l.toLowerCase());
-      } catch {
-        /* no profile yet */
-      }
-      try {
-        const picks = await spotifyPicks(seedArtists, seedGenres, 15);
-        let related: SpArtistLite[] = [];
-        if (picks.available && seedArtists[0]) {
-          try {
-            const r = await spotifyRelated(seedArtists[0]);
-            if (r.available) related = r.artists.slice(0, 8);
-          } catch {
-            /* related is optional */
-          }
-        }
-        const out: PicksData = {
-          anchor: seedArtists[0],
-          rows: picks.available ? picks.tracks : [],
-          related,
-        };
-        if (alive) {
-          setData(out);
-          picksCache = { at: Date.now(), data: out };
-        }
-      } catch {
-        if (alive) setData({ rows: [], related: [] });
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [active, data, loading]);
-
-  // Your library: top artists / top tracks / saved songs / playlists — fetched
-  // once per session with the user token (endpoints that WORK in dev mode,
-  // unlike the gated recommendation engine). Matched like everything else.
-  useEffect(() => {
-    if (!active || !loggedIn || userData || userLoading) return;
-    let alive = true;
-    setUserLoading(true);
-    (async () => {
-      try {
-        const [artists, top, saved, playlists] = await Promise.all([
-          spotifyTopArtists(8).catch(() => [] as SpArtistLite[]),
-          spotifyTopTracks(12).catch(() => [] as SpTrackHit[]),
-          spotifySavedTracks(10).catch(() => [] as SpTrackHit[]),
-          spotifyUserPlaylists(10).catch(() => [] as SpPlaylistLite[]),
-        ]);
-        const out: UserData = { artists, top, saved, playlists };
-        if (alive) {
-          setUserData(out);
-          userCache = { at: Date.now(), data: out };
-        }
-      } finally {
-        if (alive) setUserLoading(false);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [active, loggedIn, userData, userLoading]);
-
-  if (!active) return null;
-  if (loading && !data) {
-    return (
-      <div className="space-y-2 py-6">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="flex items-center gap-4 rounded-xl px-3 py-2">
-            <div className="h-12 w-12 shrink-0 animate-pulse rounded-lg bg-surface-3" />
-            <div className="flex-1 space-y-2">
-              <div className="h-3.5 w-1/3 animate-pulse rounded bg-surface-3" />
-              <div className="h-3 w-1/4 animate-pulse rounded bg-surface-2" />
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
+  const interactive = top.kind === "artist" || top.kind === "song" || top.kind === "video" || (top.kind === "album" && !!onOpenAlbum);
   return (
-    <div className="space-y-7">
-      <section aria-label="Spotify account">
-        {loggedIn ? (
-          <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-2 px-4 py-3">
-            <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#1DB954]" aria-hidden />
-            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
-              {email ?? "Spotify account connected"}
-            </span>
-            <button
-              onClick={() => spotifyLogout()}
-              className="flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold text-muted-foreground transition hover:bg-surface-3 hover:text-foreground"
-              aria-label="Log out of Spotify"
-            >
-              <LogOut className="h-3.5 w-3.5" /> Log out
-            </button>
-          </div>
-        ) : (
-          <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-2 px-4 py-3">
-            <span className="min-w-0 flex-1">
-              <span className="block text-sm font-bold text-foreground">Use your Spotify library</span>
-              <span className="block text-xs text-muted-foreground">
-                Your playlists, saved songs and top artists — audio still streams from YouTube.
-              </span>
-            </span>
-            <button
-              onClick={() => void connect()}
-              disabled={connecting}
-              className="flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--accent)] px-4 py-2 text-xs font-bold text-white transition hover:opacity-90 disabled:opacity-60"
-              aria-label="Connect Spotify"
-            >
-              {connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
-              {connecting ? "Opening" : "Connect"}
-            </button>
-          </div>
-        )}
-      </section>
-
-      {userData && userData.artists.length > 0 && (
-        <section aria-label="Your top artists">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
-            Your top artists
-          </h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-1">
-            {userData.artists.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => goToArtist(a.name)}
-                className="flex w-20 shrink-0 flex-col items-center gap-2"
-                aria-label={`Open artist ${a.name}`}
-              >
-                <span className="h-20 w-20 overflow-hidden rounded-full border border-border bg-surface-2">
-                  {a.image ? (
-                    <img src={a.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center text-lg font-black text-muted-foreground">
-                      {a.name.slice(0, 1).toUpperCase()}
-                    </span>
-                  )}
-                </span>
-                <span className="w-full truncate text-center text-xs font-semibold text-foreground">{a.name}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {userData && userData.top.length > 0 && (
-        <section aria-label="Your top tracks">
-          <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
-            Your top tracks
-          </h2>
-          <SpRowList rows={userData.top} />
-        </section>
-      )}
-
-      {userData && userData.saved.length > 0 && (
-        <section aria-label="Saved on Spotify">
-          <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
-            Saved on Spotify
-          </h2>
-          <SpRowList rows={userData.saved} />
-        </section>
-      )}
-
-      {userData && userData.playlists.length > 0 && (
-        <section aria-label="Your playlists">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
-            Your playlists
-          </h2>
-          <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
-            {userData.playlists.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => onOpenPlaylist(p)}
-                className="w-40 shrink-0 rounded-2xl p-2 text-left transition hover:bg-surface-2"
-                aria-label={`Open playlist ${p.title}`}
-              >
-                <span className="flex aspect-square w-full items-center justify-center overflow-hidden rounded-xl bg-surface-3 shadow-lg shadow-black/30">
-                  {p.image ? (
-                    <img src={p.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <ListMusic className="h-6 w-6 text-muted-foreground" />
-                  )}
-                </span>
-                <span className="mt-2 block truncate text-[13px] font-bold text-foreground">{p.title}</span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {[p.owner, p.totalTracks ? `${p.totalTracks} songs` : ""].filter(Boolean).join(" \u00b7 ")}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {data && data.related.length > 0 && (
-        <section aria-label="Fans also like">
-          <h2 className="mb-3 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">
-            {data.anchor ? `Fans of ${data.anchor} also like` : "Fans also like"}
-          </h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-1">
-            {data.related.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => goToArtist(a.name)}
-                className="flex w-20 shrink-0 flex-col items-center gap-2"
-                aria-label={`Open artist ${a.name}`}
-              >
-                <span className="h-20 w-20 overflow-hidden rounded-full border border-border bg-surface-2">
-                  {a.image ? (
-                    <img src={a.image} alt="" loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center text-lg font-black text-muted-foreground">
-                      {a.name.slice(0, 1).toUpperCase()}
-                    </span>
-                  )}
-                </span>
-                <span className="w-full truncate text-center text-xs font-semibold text-foreground">{a.name}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {data && data.rows.length > 0 && (
-        <section aria-label="Spotify picks">
-          <h2 className="mb-2 flex items-center gap-2 px-1 text-lg font-extrabold tracking-tight">
-            <Music2 className="h-4 w-4 text-muted-foreground" /> Spotify picks
-          </h2>
-          <SpRowList rows={data.rows} />
-        </section>
-      )}
-    </div>
-  );
-}
-
-/** Matched → playable row; unmatched → dimmed, honest "no YouTube match". */
-function SpRowList({ rows }: { rows: SpTrackHit[] }) {
-  return (
-    <div className="space-y-0.5">
-      {rows.map((h) =>
-        h.videoId ? (
-          <TrackRow key={h.spotifyId} track={spotifyHitToTrack(h)} radio />
-        ) : (
-          <div key={`sp-${h.spotifyId}`} className="flex items-center gap-4 rounded-xl px-3 py-2 opacity-50">
-            <span className="h-12 w-12 shrink-0 overflow-hidden rounded-lg bg-surface-3">
-              {h.image ? <img src={h.image} alt="" loading="lazy" className="h-full w-full object-cover" /> : null}
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-semibold text-foreground">{h.title}</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                {h.artist ? `${h.artist} · ` : ""}no YouTube match
-              </span>
-            </span>
-          </div>
-        )
-      )}
-    </div>
-  );
-}
-
-/** Spotify playlist page (in-tab, like the album view). Hero + play-all over
- *  the EXISTING player, then every row; unmatched ones stay dimmed. */
-function SpPlaylistView({ page, onBack }: { page: SpPlaylistResult; onBack: () => void }) {
-  const { playTrack } = usePlayer();
-  const playable = page.tracks.filter((h) => h.videoId).map(spotifyHitToTrack);
-  const cover = page.playlist.image;
-  const matched = playable.length;
-  const totalMin = Math.round(page.tracks.reduce((s, t) => s + t.durationSec, 0) / 60);
-  return (
-    <div className="space-y-6 pb-8">
-      <div
-        className="relative -mx-4 -mt-4 overflow-hidden px-4 pb-6 pt-4 sm:-mx-6 sm:px-6"
-        style={{ background: "linear-gradient(180deg, rgba(255,255,255,0.07) 0%, transparent 100%)" }}
+    <section aria-label="Top result">
+      <h2 className="mb-2 px-1 text-sm font-extrabold uppercase tracking-wider text-muted-foreground">Top result</h2>
+      <button
+        onClick={handleTap}
+        disabled={!interactive || opening}
+        className="group flex w-full items-center gap-4 rounded-2xl border border-border bg-surface-2 p-3 text-left transition hover:bg-surface-3 disabled:opacity-60"
+        aria-label={`Open ${kindLabel.toLowerCase()} ${top.name}`}
       >
-        <button
-          onClick={onBack}
-          className="mb-5 flex h-10 w-10 items-center justify-center rounded-full bg-surface-2 transition hover:bg-surface-3"
-          aria-label="Go back"
-        >
-          <X className="h-5 w-5" />
-        </button>
-        <div className="flex flex-col items-center gap-6 text-center sm:flex-row sm:items-end sm:text-left">
-          {cover ? (
-            <img
-              src={cover}
-              alt=""
-              className="h-40 w-40 shrink-0 rounded-3xl object-cover shadow-xl shadow-black/40 sm:h-48 sm:w-48"
-            />
+        <span className="relative h-20 w-20 shrink-0 overflow-hidden rounded-xl shadow-lg shadow-black/30">
+          {top.thumb ? (
+            <img src={top.thumb} alt="" className="h-full w-full object-cover" />
           ) : (
-            <span className="flex h-40 w-40 shrink-0 items-center justify-center rounded-3xl bg-surface-3 shadow-xl shadow-black/40 sm:h-48 sm:w-48">
-              <ListMusic className="h-10 w-10 text-muted-foreground" />
+            <span className="flex h-full w-full items-center justify-center bg-surface-3">
+              {top.kind === "artist" ? (
+                <span className="text-2xl font-black text-muted-foreground">{top.name.slice(0, 1).toUpperCase()}</span>
+              ) : (
+                <Icon className="h-6 w-6 text-muted-foreground" />
+              )}
             </span>
           )}
-          <div className="min-w-0 flex-1">
-            <p className="text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground">Playlist</p>
-            <h1 className="mt-1 break-words text-3xl font-black tracking-tight sm:text-5xl">{page.playlist.title}</h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              {page.playlist.owner} · {page.playlist.totalTracks ?? page.tracks.length} song
-              {(page.playlist.totalTracks ?? page.tracks.length) === 1 ? "" : "s"}
-              {totalMin > 0 && <> · about {totalMin} min</>}
-              {matched < page.tracks.length && <> · {page.tracks.length - matched} without YouTube match</>}
-            </p>
-          </div>
-        </div>
-        {playable.length > 0 && (
-          <div className="mt-6 flex items-center gap-3">
-            <button
-              onClick={() => playTrack(playable[0], playable, page.playlist.title)}
-              className="flex items-center gap-2 rounded-full bg-[var(--accent)] px-6 py-3 text-sm font-bold text-white shadow-lg transition hover:opacity-90"
-              aria-label="Play playlist"
-            >
-              <Play className="h-4 w-4" /> Play
-            </button>
-          </div>
+          {(top.kind === "song" || top.kind === "video" || opening) && (
+            <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition group-hover:opacity-100 group-active:opacity-100">
+              {opening ? <Loader2 className="h-5 w-5 animate-spin text-white" /> : <Play className="h-6 w-6 fill-white text-white" />}
+            </span>
+          )}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5">
+            <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">{kindLabel}</span>
+          </span>
+          <span className="mt-0.5 block truncate text-base font-extrabold text-foreground">{top.name}</span>
+          <span className="block truncate text-xs text-muted-foreground">{top.subtitle || kindLabel}</span>
+          {top.kind === "album" && (
+            <span className="mt-1 block text-[11px] font-semibold text-muted-foreground/80">Tap to open the full album</span>
+          )}
+        </span>
+        {(top.kind === "song" || top.kind === "video") && (
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] shadow-xl transition group-hover:scale-105">
+            <Play className="ml-0.5 h-5 w-5 fill-black text-black" />
+          </span>
         )}
-      </div>
-      <SpRowList rows={page.tracks} />
-    </div>
+      </button>
+    </section>
   );
 }

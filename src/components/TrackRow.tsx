@@ -14,6 +14,19 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { AddToPlaylistSheet, DownloadMenuItem } from "./PlayerMenus";
 import { Cover, NowBars } from "./Cover";
 
+/**
+ * "96M" / "4.2B" / "190K" → "96M plays" (the YTM row byline). Null when the
+ * count is absent or zero — album-page tracks carry no view counts, and "0K
+ * plays" is worse than nothing.
+ */
+function playsLabel(plays: string): string | null {
+  const m = /^([\d.]+)\s*([KMB]?)$/i.exec((plays || "").trim());
+  if (!m) return null;
+  const mult = { k: 1e3, m: 1e6, b: 1e9 }[m[2]?.toLowerCase() ?? ""] ?? 1;
+  if (parseFloat(m[1]) * mult <= 0) return null;
+  return `${m[1]}${(m[2] ?? "").toUpperCase()} plays`;
+}
+
 interface TrackRowProps {
   track: Track;
   index?: number; // show number instead of cover when provided
@@ -80,13 +93,15 @@ export function TrackRow({ track, index, context, showAlbum = true, label, radio
         )}
       </button>
 
-      {/* title + artist (album stands in when the source gave no artist credit) */}
+      {/* title + artist + plays (album stands in when the source gave no artist credit;
+          play counts always show when known — YTM's row byline) */}
       <button onClick={handlePlay} className="min-w-0 flex-1 text-left">
         <p className={cn("truncate text-sm font-semibold", active ? "text-[var(--accent)]" : "text-foreground")}>{track.title}</p>
-        {(track.artist || showAlbum) && (
+        {(track.artist || showAlbum || playsLabel(track.plays)) && (
           <p className="truncate text-xs text-muted-foreground">
             {track.artist || ""}
             {showAlbum && <span className="hidden sm:inline">{track.artist ? " · " : ""}{track.album}</span>}
+            {playsLabel(track.plays) && <span>{track.artist ? " · " : ""}{playsLabel(track.plays)}</span>}
           </p>
         )}
       </button>

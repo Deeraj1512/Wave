@@ -44,10 +44,32 @@ export interface ApiAlbum {
   thumb?: string;
 }
 
+/** ARTIST entity — the Artists tab's circular cards (YTM's "Artist • 382M monthly audience"). */
+export interface ApiArtistEntity {
+  name: string;
+  /** "382M monthly audience" — YTM's own byline, shown under the name */
+  subtitle?: string;
+  thumb?: string;
+  /** UC… channel id when YTM carried it (the artist page itself resolves by name) */
+  browseId?: string;
+}
+
+/** YTM's top-result card — one entity pinned above every search result. */
+export interface ApiTopEntity {
+  kind: "artist" | "album" | "song" | "video";
+  name: string;
+  subtitle: string;
+  thumb?: string;
+  browseId?: string;
+  videoId?: string;
+}
+
 interface SearchResponse {
   query: string;
   tracks: ApiTrack[];
   albums?: ApiAlbum[];
+  artists?: ApiArtistEntity[];
+  top?: ApiTopEntity | null;
   dropped: Record<string, number>;
   attempts: string[];
   cached?: boolean;
@@ -201,8 +223,26 @@ const INDIAN_LANGS = new Set(["Hindi", "Tamil", "Telugu", "Punjabi", "Kannada", 
  *   5. MOST-PLAYED on top   — play counts decide the tail: most played first,
  *                             least played at the bottom of the list.
  */
-export function tasteRank(tracks: Track[], rels: number[]): Track[] {
+/**
+ * A "browse" query — one token, ≤ 3 chars ("om", "v", "ఓం"). No song is two
+ * letters, so there is no typing intent: results rank like YouTube Music's own
+ * browse — popularity leads inside the language barrier (see tasteRank's
+ * browse lane). Must stay in sync with yt/search.isBrowseQuery (kept local —
+ * api.ts must not statically import the server-side search chain).
+ */
+export function isBrowseQuery(q: string): boolean {
+  const nq = (q || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+  const toks = nq.split(/\s+/).filter((w) => w.length > 0);
+  return toks.length === 1 && toks[0].length <= 3;
+}
+
+export function tasteRank(tracks: Track[], rels: number[], opts?: { browse?: boolean }): Track[] {
   try {
+    const browse = !!opts?.browse;
     const fam = new Set(topArtists(10).map((a) => foldName(a)).filter(Boolean));
     const langW = tasteLangWeights();
     if (fam.size === 0 && langW.size === 0) return tracks;
@@ -215,15 +255,24 @@ export function tasteRank(tracks: Track[], rels: number[]): Track[] {
       // Language barrier ladder: listened language by play weight (100-199,
       // compressed so any listened language beats any non-listened one) ·
       // Indian-not-listened floor +1 · unknown 0 · foreign -1 (the sink).
+      // BROWSE lane ("om"): YTM-style popularity ranking inside the barrier —
+      // every Indian/listened language shares ONE lane (+1), the foreign sink
+      // stays last; the user's "no English above Indian" rule still holds.
       let langBoost = 0;
       if (t.lang) {
-        const w = langW.get(t.lang);
-        langBoost = w !== undefined ? 100 + Math.min(99, w) : INDIAN_LANGS.has(t.lang) ? 1 : -1;
+        if (browse) {
+          langBoost = langW.has(t.lang) || INDIAN_LANGS.has(t.lang) ? 1 : -1;
+        } else {
+          const w = langW.get(t.lang);
+          langBoost = w !== undefined ? 100 + Math.min(99, w) : INDIAN_LANGS.has(t.lang) ? 1 : -1;
+        }
       }
-      const relB = bucket(rels[i] ?? 0);
+      // browse mode has no typed intent — relevance buckets stay flat so views
+      // decide inside the language lane (langBoost → taste → views → index).
+      const relB = browse ? 0 : bucket(rels[i] ?? 0);
       // "The song I'm typing" — exact/prefix/phrase-in-title — must top the
       // list no matter what; taste orders everything below it.
-      const typed = relB >= 3 ? 1 : 0;
+      const typed = !browse && relB >= 3 ? 1 : 0;
       return { t, typed, langBoost, relB, views: playsNum(t.plays), taste, i };
     });
     scored.sort(
@@ -242,56 +291,59 @@ export function tasteRank(tracks: Track[], rels: number[]): Track[] {
 }
 
 export async function searchApi(q: string, signal?: AbortSignal): Promise<Track[]> {
+  const relsOf = (d: SearchResponse) => d.tracks.map((t) => t.rel ?? 0);
   if (IS_NATIVE) {
     // APK: no backend — run the identical originals-only YTM search in-process.
     const { searchOriginals } = await import("./yt/search");
     const data = await searchOriginals(q);
-    return tasteRank(
-      data.tracks.map(mapApiTrack),
-      data.tracks.map((t) => t.rel ?? 0)
-    );
+    return tasteRank(data.tracks.map(mapApiTrack), relsOf(data), { browse: isBrowseQuery(q) });
   }
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal });
   if (!res.ok) throw new Error(`search ${res.status}`);
   const data = (await res.json()) as SearchResponse;
-  return tasteRank(
-    data.tracks.map(mapApiTrack),
-    data.tracks.map((t) => t.rel ?? 0)
-  );
+  return tasteRank(data.tracks.map(mapApiTrack), relsOf(data), { browse: isBrowseQuery(q) });
 }
 
 const mapApiTrack = (t: ApiTrack): Track => apiTrackToTrack(t);
 
 // ── Albums (Innertube access: entity search + exact album page) ─────────────
 
-/** Song + album entities for the search screen (albums ride along when the
- *  server's response carried them; the Albums tab fetches a dedicated
- *  entity search itself when this list is empty). */
+/** Song + album + artist + top-card entities for the search screen. The server
+ *  response carries them all (YTM page model); the Artists tab additionally
+ *  fetches a dedicated artist search when this list came back empty. */
 export async function searchFullApi(
   q: string,
   signal?: AbortSignal
-): Promise<{ tracks: Track[]; albums: ApiAlbum[] }> {
+): Promise<{ tracks: Track[]; albums: ApiAlbum[]; artists: ApiArtistEntity[]; top: ApiTopEntity | null }> {
+  const pack = (d: SearchResponse) => ({
+    tracks: tasteRank(d.tracks.map(mapApiTrack), d.tracks.map((t) => t.rel ?? 0), { browse: isBrowseQuery(q) }),
+    albums: d.albums ?? [],
+    artists: d.artists ?? [],
+    top: d.top ?? null,
+  });
   if (IS_NATIVE) {
     const { searchOriginals } = await import("./yt/search");
-    const data = await searchOriginals(q);
-    return {
-      tracks: tasteRank(
-        data.tracks.map(mapApiTrack),
-        data.tracks.map((t) => t.rel ?? 0)
-      ),
-      albums: data.albums ?? [],
-    };
+    return pack(await searchOriginals(q));
   }
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal });
   if (!res.ok) throw new Error(`search ${res.status}`);
-  const data = (await res.json()) as SearchResponse;
-  return {
-    tracks: tasteRank(
-      data.tracks.map(mapApiTrack),
-      data.tracks.map((t) => t.rel ?? 0)
-    ),
-    albums: data.albums ?? [],
-  };
+  return pack((await res.json()) as SearchResponse);
+}
+
+/** ARTIST entities for a name (the Artists tab's dedicated fallback search). */
+export async function artistSearchApi(q: string, signal?: AbortSignal): Promise<ApiArtistEntity[]> {
+  if (IS_NATIVE) {
+    const { searchArtistsOnly } = await import("./yt/search");
+    return searchArtistsOnly(q).catch(() => []);
+  }
+  try {
+    const res = await fetch(`/api/artists?q=${encodeURIComponent(q)}`, { signal });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { artists?: ApiArtistEntity[] };
+    return Array.isArray(data.artists) ? data.artists : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Album entities for a name ("type the album, find the album"). */

@@ -48,8 +48,6 @@ artifact (Actions tab → latest run → Artifacts).
   Platform hosts should use the default `next build`.
 - Optional `.env` `COOKIE` (server only): a YTM cookie that reduces bot-gating
   on datacenter IPs. The APK needs no server configuration at all.
-- Spotify layer: the APK talks to the metadata-only Cloudflare Worker in
-  `bridge/`, deployed automatically by `.github/workflows/deploy-bridge.yml`
-  — the client secret lives in Worker env vars, never in the APK. Track-to-
-  videoId matching runs in-app (`src/lib/spotify/match.ts`) on Wave's own
-  YouTube chain. Setup: `bridge/README.md`.
+- Search is YouTube-Music-style (batch18): one request returns YTM's own
+  top-result card, the songs list (play counts on rows), album entities and
+  artist entities — the Songs / Albums / Artists tabs all read from it.
