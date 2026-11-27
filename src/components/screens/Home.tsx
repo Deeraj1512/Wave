@@ -18,7 +18,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Loader2, LogIn, Music2, Play } from "lucide-react";
+import { Music2, Play } from "lucide-react";
 import { Shelf } from "../Shelf";
 import { SongCard, QuickPick, SpeedDialTile } from "../Cards";
 import { usePlayer } from "@/lib/player";
@@ -32,9 +32,6 @@ import { getProfile, profileVersion, rankedTasteLangs, subscribeProfile } from "
 import { strictLangFilter, feedLangs, roundRobin, familiarWeave, familiarSet, rotateBy } from "@/lib/taste";
 import type { Track, Lang } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { spotifyAvailable, spotifyHitToTrack } from "@/lib/spotify/bridge";
-import { spotifyLoggedIn, spotifyLogin, subscribeUserAuth } from "@/lib/spotify/userAuth";
-import { spotifySavedTracks, spotifyTopTracks } from "@/lib/spotify/user";
 
 // Mood → search intent. Deliberately language-agnostic: the listener's language
 // is prepended at fetch time from their own play history (see dominantLang),
@@ -847,11 +844,6 @@ export function HomeScreen() {
         </section>
       )}
 
-      {/* Spotify on the home feed — the listener's own library (top tracks +
-          saved songs) once logged in; a slim connect card before that. Renders
-          nothing while the bridge is down: home stays pure-YTM otherwise. */}
-      <SpotifyFeedSection />
-
       {/* Radio — artist profiles; tap opens the artist's SONG LIST (the
           artist page — hero, Play, Shuffle). Nothing auto-plays from the
           shelf tap (user's exact ask). Still after the personal shelves,
@@ -894,138 +886,5 @@ export function HomeScreen() {
         </Shelf>
       )}
     </div>
-  );
-}
-
-/** Home-session cache for the Spotify shelves — hydrates instantly so the
- *  shelf never "comes and goes" while the fetch runs (same contract as the
- *  Made-for-you cache above). */
-const SP_HOME_CACHE = "wave.sp.home.cache.v1";
-
-function readSpHomeCache(): { top: Track[]; saved: Track[] } | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = JSON.parse(localStorage.getItem(SP_HOME_CACHE) ?? "null") as {
-      top: Track[];
-      saved: Track[];
-    } | null;
-    if (raw && Array.isArray(raw.top) && Array.isArray(raw.saved)) return raw;
-  } catch {
-    /* corrupt = no cache */
-  }
-  return null;
-}
-
-function saveSpHomeCache(data: { top: Track[]; saved: Track[] }) {
-  try {
-    localStorage.setItem(SP_HOME_CACHE, JSON.stringify(data));
-  } catch {
-    /* private mode — rebuilt each visit */
-  }
-}
-
-function SpotifyFeedSection() {
-  const [ok, setOk] = useState<boolean | null>(null);
-  const loggedIn = useSyncExternalStore(subscribeUserAuth, spotifyLoggedIn, () => false);
-  const [data, setData] = useState<{ top: Track[]; saved: Track[] } | null>(() => readSpHomeCache());
-  const [loading, setLoading] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const [connectError, setConnectError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    spotifyAvailable().then((v) => alive && setOk(v)).catch(() => alive && setOk(false));
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (ok !== true || !loggedIn) return;
-    let alive = true;
-    setLoading(true);
-    (async () => {
-      try {
-        const [topHits, savedHits] = await Promise.all([
-          spotifyTopTracks(10).catch(() => []),
-          spotifySavedTracks(8).catch(() => []),
-        ]);
-        const out = {
-          top: topHits.filter((h) => h.videoId).map(spotifyHitToTrack),
-          saved: savedHits.filter((h) => h.videoId).map(spotifyHitToTrack),
-        };
-        if (alive) {
-          setData(out);
-          saveSpHomeCache(out);
-        }
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [ok, loggedIn]);
-
-  if (ok !== true) return null;
-
-  if (!loggedIn) {
-    return (
-      <section aria-label="Connect Spotify">
-        <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-2 px-4 py-3">
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-bold text-foreground">Use your Spotify library</span>
-            <span className="block text-xs text-muted-foreground">
-              {connectError
-                ? connectError
-                : "Sign in once — your playlists, saved songs and top artists fill Wave's feed."}
-            </span>
-          </span>
-          <button
-            onClick={() => {
-              if (connecting) return;
-              setConnecting(true);
-              setConnectError(null);
-              spotifyLogin()
-                .catch((e: unknown) =>
-                  setConnectError(
-                    e instanceof Error
-                      ? e.message
-                      : "Sign-in didn't finish — is your account added under User Management?"
-                  )
-                )
-                .finally(() => setConnecting(false));
-            }}
-            disabled={connecting}
-            className="flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--accent)] px-4 py-2 text-xs font-bold text-white transition hover:opacity-90 disabled:opacity-60"
-            aria-label="Connect Spotify"
-          >
-            {connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
-            {connecting ? "Opening" : "Connect"}
-          </button>
-        </div>
-      </section>
-    );
-  }
-
-  // logged in: library shelves (cached first, refreshed in the background)
-  if (!data) return null;
-  return (
-    <>
-      {data.top.length > 0 && (
-        <Shelf title="Your top tracks">
-          {data.top.map((t) => (
-            <SongCard key={`sp-top-${t.id}-${t.title}`} track={t} radio />
-          ))}
-        </Shelf>
-      )}
-      {data.saved.length > 0 && (
-        <Shelf title="Saved on Spotify">
-          {data.saved.map((t) => (
-            <SongCard key={`sp-sav-${t.id}-${t.title}`} track={t} radio />
-          ))}
-        </Shelf>
-      )}
-    </>
   );
 }
