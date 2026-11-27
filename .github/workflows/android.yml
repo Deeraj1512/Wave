@@ -55,14 +55,6 @@ jobs:
 
       # static SPA export (scripts/build-apk-web.mjs) + cap sync into android/
       - name: Build web bundle + sync
-        env:
-          # Spotify bridge origin — read by src/lib/spotify/config.ts at build
-          # time (NEXT_PUBLIC_* is inlined by next build). Set it as a
-          # repository VARIABLE (not a secret — it is the bridge's public URL),
-          # e.g. https://wave-xxxx.vercel.app. Empty/unset → the APK export
-          # bakes no bridge origin and the Spotify surfaces stay hidden
-          # (Wave keeps working as a pure YTM app).
-          NEXT_PUBLIC_SPOTIFY_BRIDGE_URL: ${{ vars.NEXT_PUBLIC_SPOTIFY_BRIDGE_URL }}
         run: bun run build:apk
 
       - name: Assemble signed release APK
