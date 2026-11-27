@@ -1,0 +1,45 @@
+name: batch19 cleanup (fix the broken build — delete the last Spotify importers)
+
+# The batch18 cleanup deleted src/lib/spotify/ — but two files that still
+# imported it were missed:
+#   - src/app/callback/page.tsx        (old Spotify OAuth callback — imports the
+#                                       deleted @/lib/spotify/userAuth)
+#   - src/components/screens/Home.tsx  (the batch19 upload replaces this one)
+# Next.js cannot resolve those modules, so "npx next build" exits 1 and the
+# APK never builds ("bun run build:apk" fails at the web bundle step).
+#
+# Upload batch19's src/components/screens/Home.tsx FIRST (see the batch19
+# README), then run this workflow ONCE. It deletes the dead files on main and
+# pushes — and the push also triggers the Android APK build with the fixed
+# Home.tsx, so the green run comes automatically.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove the last Spotify importers (+ the dead one-shot workflows/docs)
+        run: |
+          git rm -r --ignore-unmatch src/app/callback src/lib/spotify src/app/api/spotify bridge
+          git rm --ignore-unmatch \
+            .github/workflows/batch18-cleanup.yml \
+            .github/workflows/deploy-bridge.yml \
+            SPOTIFY-SETUP.md \
+            scripts/test_spotify_pkce.ts \
+            scripts/test_spotify_match.ts \
+            scripts/test_bridge_smoke.ts \
+            netlify.toml
+
+      - name: Commit and push
+        run: |
+          git config user.name "wave-batch19"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "batch19: fix the broken build — delete the last Spotify importers (src/app/callback, SPOTIFY-SETUP.md, test_spotify_pkce.ts) and retire the batch18 one-shot workflow" || echo "nothing to remove"
+          git push
